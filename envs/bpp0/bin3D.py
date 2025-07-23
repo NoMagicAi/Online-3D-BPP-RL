@@ -1,4 +1,5 @@
 from .space import Space
+import random
 import numpy as np
 import copy
 import gym
@@ -41,6 +42,15 @@ class PackingGame(gym.Env):
         self.observation_space = gym.spaces.Box(low=0.0, high=self.space.height, shape=(self.obs_len,))
         
 
+    def seed(self, seed=None):
+        """Sets the seed for this env's random number generator(s)."""
+        np.random.seed(seed)
+        random.seed(seed)
+        # The box_creator likely uses randomness, so it's good practice
+        # to reset it or its seed if it has a seed method.
+        # For now, seeding the global generators should be sufficient.
+        return [seed]
+    
     def get_box_ratio(self):
         coming_box = self.next_box
         return (coming_box[0] * coming_box[1] * coming_box[2]) / (self.space.plain_size[0] * self.space.plain_size[1] * self.space.plain_size[2])
