@@ -16,13 +16,26 @@ class RolloutStorage(object):
         self.value_preds = torch.zeros(num_steps + 1, num_processes, 1)
         self.returns = torch.zeros(num_steps + 1, num_processes, 1)
         self.action_log_probs = torch.zeros(num_steps, num_processes, 1)
+
+        # --- ACTION TENSOR MODIFICATION ---
+        # Determine the shape of a single action
         if action_space.__class__.__name__ == 'Discrete':
             action_shape = 1
+        elif action_space.__class__.__name__ == 'MultiDiscrete':
+            # For MultiDiscrete, the shape is the number of discrete action parts.
+            # e.g., for [L, W, 2], this is 3.
+            action_shape = action_space.nvec.shape[0]
         else:
+            # Fallback for continuous spaces like Box
             action_shape = action_space.shape[0]
+        
+        # Initialize the actions tensor with the correct shape
         self.actions = torch.zeros(num_steps, num_processes, action_shape)
-        if action_space.__class__.__name__ == 'Discrete':
+        
+        # Both Discrete and MultiDiscrete actions are represented as integers
+        if action_space.__class__.__name__ in ['Discrete', 'MultiDiscrete']:
             self.actions = self.actions.long()
+        
         self.masks = torch.ones(num_steps + 1, num_processes, 1)
         if enable_rotation:
             self.location_masks = torch.zeros(num_steps+1, num_processes, 2 * pallet_size**2)

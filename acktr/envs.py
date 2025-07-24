@@ -38,7 +38,8 @@ def make_env(env_id, seed, rank, log_dir, allow_early_resets, args):
             env = gym.make(env_id,
                            enable_rotation = args.enable_rotation,
                            box_set = args.box_size_set, container_size = args.container_size, test = False,
-                           data_name = None, data_type = args.data_type)
+                           data_name = None, data_type = args.data_type,
+                           disable_env_checker=True)
 
         is_atari = hasattr(gym.envs, 'atari') and isinstance(
             env.unwrapped, gym.envs.atari.atari_env.AtariEnv)

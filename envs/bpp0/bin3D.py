@@ -1,138 +1,175 @@
-from .space import Space
+# envs/bpp0/bin3D.py
+
 import random
 import numpy as np
-import copy
 import gym
+
+from .space import Space
 from .cutCreator import CuttingBoxCreator
-from .mdCreator  import MDlayerBoxCreator
+from .mdCreator import MDlayerBoxCreator
 from .binCreator import RandomBoxCreator, LoadBoxCreator, BoxCreator
 
+
 class PackingGame(gym.Env):
-    def __init__(self, box_creator=None, container_size = (20, 20, 20),
-                 box_set = None, data_name = None, test = False,
-                 data_type = 'cut1', enable_rotation=False, **kwags):
+    def __init__(
+        self,
+        box_creator=None,
+        container_size=(10, 10, 10),
+        box_set=None,
+        data_name=None,
+        test=False,
+        data_type="rs",
+        enable_rotation=False,
+        **kwags
+    ):
+
         self.box_creator = box_creator
         self.bin_size = container_size
-        self.area = int(self.bin_size[0] * self.bin_size[1])
+        self.width = self.bin_size[0]
+        self.length = self.bin_size[1]
+        self.area = int(self.width * self.length)
         self.space = Space(*self.bin_size)
         self.can_rotate = enable_rotation
 
+        # Stored masks to avoid re-computation
+        self.mask_o0 = None
+        self.mask_o1 = None
+
         if not test and box_creator is None:
             assert box_set is not None
-            if data_type == 'rs':
-                print('using random data')
-                self.box_creator = RandomBoxCreator(box_set)
-            elif data_type == 'cut1':
+
+            # --- THE FIX ---
+            # This logic correctly selects the BoxCreator based on data_type
+            if data_type == "cut1":
                 low = list(box_set[0])
                 up = list(box_set[-1])
                 low.extend(up)
-                print(low)
-                self.box_creator = CuttingBoxCreator(container_size, low, self.can_rotate)
-            elif data_type == 'cut2':
-                print('using md data')
-                self.box_creator = MDlayerBoxCreator(container_size, [box_set[0][0], box_set[-1][0]])
-            assert isinstance(self.box_creator, BoxCreator)
+                self.box_creator = CuttingBoxCreator(
+                    container_size, low, self.can_rotate
+                )
+            elif data_type == "cut2":
+                self.box_creator = MDlayerBoxCreator(
+                    container_size, [box_set[0][0], box_set[-1][0]]
+                )
+            else:  # Defaults to 'rs'
+                self.box_creator = RandomBoxCreator(box_set)
 
-        if test:
-            self.box_creator = LoadBoxCreator(data_name)
+        self.obs_len = self.area * (1 + 3 + 2)
+        num_orientations = 2 if self.can_rotate else 1
+        self.action_space = gym.spaces.MultiDiscrete(
+            [num_orientations, self.width, self.length]
+        )
+        self.observation_space = gym.spaces.Box(
+            low=0.0, high=self.space.height, shape=(self.obs_len,)
+        )
 
-        self.act_len = self.area * (1+self.can_rotate)
-        self.obs_len = self.area * (1+3)
-        self.action_space = gym.spaces.Discrete(self.act_len)
-        self.observation_space = gym.spaces.Box(low=0.0, high=self.space.height, shape=(self.obs_len,))
-        
+    def _update_masks(self):
+        """A private helper to compute and store the feasibility masks for the current state."""
+        original_box = self.next_box
+        self.mask_o0 = self.space.get_stability_map(original_box).astype(np.int32)
+
+        if self.can_rotate:
+            rotated_box = (original_box[1], original_box[0], original_box[2])
+            self.mask_o1 = self.space.get_stability_map(rotated_box).astype(np.int32)
+        else:
+            self.mask_o1 = np.zeros_like(self.mask_o0)
 
     def seed(self, seed=None):
-        """Sets the seed for this env's random number generator(s)."""
         np.random.seed(seed)
         random.seed(seed)
-        # The box_creator likely uses randomness, so it's good practice
-        # to reset it or its seed if it has a seed method.
-        # For now, seeding the global generators should be sufficient.
         return [seed]
-    
-    def get_box_ratio(self):
-        coming_box = self.next_box
-        return (coming_box[0] * coming_box[1] * coming_box[2]) / (self.space.plain_size[0] * self.space.plain_size[1] * self.space.plain_size[2])
-
 
     def get_box_plain(self):
-        x_plain = np.ones(self.space.plain_size[:2], dtype=np.int32) * self.next_box[0]
-        y_plain = np.ones(self.space.plain_size[:2], dtype=np.int32) * self.next_box[1]
-        z_plain = np.ones(self.space.plain_size[:2], dtype=np.int32) * self.next_box[2]
+        x_plain = np.ones((self.width, self.length), dtype=np.int32) * self.next_box[0]
+        y_plain = np.ones((self.width, self.length), dtype=np.int32) * self.next_box[1]
+        z_plain = np.ones((self.width, self.length), dtype=np.int32) * self.next_box[2]
         return (x_plain, y_plain, z_plain)
-
-    def reset(self):
-        self.box_creator.reset()
-        self.space = Space(*self.bin_size)
-        self.box_creator.generate_box_size()
-        return self.cur_observation
 
     @property
     def cur_observation(self):
+        """This property is now very fast as it just reads the pre-computed masks."""
         hmap = self.space.plain
-        # mask = self.get_possible_position()
         size = self.get_box_plain()
-        return np.reshape(np.stack((hmap,  *size)), newshape=(-1,))
+        return np.reshape(
+            np.stack((hmap, *size, self.mask_o0, self.mask_o1)), newshape=(-1,)
+        )
 
     @property
     def next_box(self):
         return self.box_creator.preview(1)[0]
 
-    def get_possible_position(self, plain=None):
-        x = self.next_box[0]
-        y = self.next_box[1]
-        z = self.next_box[2]
+    def reset(self):
+        self.box_creator.reset()
+        self.space = Space(*self.bin_size)
+        self.box_creator.generate_box_size()
+        self._update_masks()  # Compute initial masks
+        return self.cur_observation
 
-        if plain is None:
-            plain = self.space.plain
-
-        width = self.space.plain_size[0]
-        length = self.space.plain_size[1]
-
-        action_mask = np.zeros(shape=(width, length), dtype=np.int32)
-        
-        for i in range(width-x+1):
-            for j in range(length-y+1):
-                if self.space.check_box(plain, x, y, i, j, z) >= 0:
-                    action_mask[i, j] = 1
-
-        if action_mask.sum() == 0:
-            action_mask[:, :] = 1
-        
-        return action_mask
+    def get_box_ratio(self):
+        coming_box = self.next_box
+        box_vol = coming_box[0] * coming_box[1] * coming_box[2]
+        bin_vol = self.space.width * self.space.length * self.space.height
+        return box_vol / bin_vol if bin_vol > 0 else 0.0
 
     def step(self, action):
-        if isinstance(action, np.ndarray) or isinstance(action, list):
-            idx = action[0]
+        orientation, x_pos, y_pos = action
+
+        mask_to_check = self.mask_o1 if bool(orientation) else self.mask_o0
+
+        if mask_to_check[x_pos, y_pos]:
+            # Action is VALID
+
+            # --- REWARD CALCULATION FIX ---
+            # Calculate the full reward based on the CURRENT state, BEFORE any changes.
+            alpha = 10.0
+            beta = 0.1
+
+            volumetric_reward = alpha * self.get_box_ratio()
+
+            bin_volume = self.space.width * self.space.length * self.space.height
+            v_safe = self._calculate_v_safe()  # V_safe of the current state
+            safety_reward = beta * (v_safe / bin_volume)
+
+            reward = volumetric_reward + safety_reward
+
+            # Now, execute the action and change the state
+            self.space.drop_box(self.next_box, (x_pos, y_pos), bool(orientation))
+
+            # Advance the item queue and compute masks for the *next* state
+            self.box_creator.drop_box()
+            self.box_creator.generate_box_size()
+            self._update_masks()
+
+            # Check if the new state is terminal
+            done = not (self.mask_o0.any() or self.mask_o1.any())
         else:
-            idx = action
-        flag = False
-        # check whether rotate the box
-        if idx > self.area:
-            assert self.can_rotate
-            idx = idx - self.area
-            flag = True
-        succeeded = self.space.drop_box(self.next_box, idx, flag)
-
-        if not succeeded:
-            reward = 0.0
+            # Action is INVALID
             done = True
-            info = {'counter':len(self.space.boxes), 'ratio':self.space.get_ratio(), 'mask':np.ones(shape=self.act_len)}
-            return self.cur_observation, reward, done, info
+            reward = 0.0
 
-        box_ratio = self.get_box_ratio()
-
-        self.box_creator.drop_box() # remove current box from the list
-        self.box_creator.generate_box_size() # add a new box to the list
-
-        plain = self.space.plain
-
-        reward = box_ratio * 10
-        done = False
-        info = dict()
-        info['counter'] = len(self.space.boxes)
-        info['ratio'] = self.space.get_ratio()
-        # info['mask'] = self.get_possible_position().reshape((-1,))
+        info = {
+            "counter": len(self.space.stacking_tree.boxes),
+            "ratio": self.space.get_ratio(),
+        }
         return self.cur_observation, reward, done, info
 
+    def _calculate_v_safe(self):
+        """
+        Calculates the V_safe metric as described in the paper.
+        V_safe is the sum of available volume in all "safe loading points".
+        A loading point (r, c) is safe if the path from the entrance line (c=0) is clear.
+        """
+        v_safe = 0
+        heightmap = self.space.plain
+
+        # Iterate through each column (x-position)
+        for r in range(self.width):
+            # Iterate from the front of the bin (y=0) to the back
+            for c in range(self.length):
+                # If we hit an obstacle, no further points in this column can be "safe"
+                if heightmap[r, c] > 0:
+                    break
+                # If the path is clear, add the available volume of this column to V_safe
+                v_safe += self.space.height - heightmap[r, c]
+
+        return v_safe
