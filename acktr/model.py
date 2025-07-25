@@ -51,92 +51,90 @@ class Policy(nn.Module):
         value, _, _ = self.base(inputs, rnn_hxs, masks)
         return value
 
-    def act(self, inputs, rnn_hxs, masks, deterministic=False):
-        value, actor_features, rnn_hxs = self.base(inputs, rnn_hxs, masks)
+    def act(self, inputs, rnn_hs, masks, deterministic=False):
+        value, actor_features, rnn_hs = self.base(inputs, rnn_hs, masks)
         
-        batch_size = actor_features.shape[0]
-        device = actor_features.device
-
-        # 1. Get Orientation distribution and sample
-        mask_o = torch.ones(batch_size, 2).to(device)
-        dist_o, _, _ = self.dist_o(actor_features, mask_o)
+        obs_image = inputs.view(-1, 6, self.base.width, self.base.length)
+        mask_o0, mask_o1 = obs_image[:, 4, :, :], obs_image[:, 5, :, :]
         
-        # --- THIS IS THE FIX ---
-        # Both .mode and .sample must be CALLED as methods with parentheses ()
+        o_mask_0_valid = mask_o0.any(dim=(-1,-2)).float()
+        o_mask_1_valid = mask_o1.any(dim=(-1,-2)).float()
+        o_mask = torch.stack([o_mask_0_valid, o_mask_1_valid], dim=1)
+        
+        dist_o, _, _ = self.dist_o(actor_features, o_mask)
         action_o = dist_o.mode() if deterministic else dist_o.sample()
 
-        # 2. Get X-position distribution and sample
         o_one_hot = F.one_hot(action_o.squeeze(-1), num_classes=2).float()
         x_input = torch.cat([actor_features, o_one_hot], dim=1)
-        mask_x = torch.ones(batch_size, self.base.width).to(device)
-        dist_x, _, _ = self.dist_x(x_input, mask_x)
         
-        action_x = dist_x.mode() if deterministic else dist_x.sample()
+        condition = (action_o == 0).view(-1, 1, 1)
+        mask_for_o = torch.where(condition, mask_o0, mask_o1)
 
-        # 3. Get Y-position distribution and sample
+        x_mask = mask_for_o.any(dim=-1).float()
+        dist_x, _, _ = self.dist_x(x_input, x_mask)
+        action_x = dist_x.mode() if deterministic else dist_x.sample()
+        
         x_one_hot = F.one_hot(action_x.squeeze(-1), num_classes=self.base.width).float()
         y_input = torch.cat([actor_features, o_one_hot, x_one_hot], dim=1)
-        mask_y = torch.ones(batch_size, self.base.length).to(device)
-        dist_y, _, _ = self.dist_y(y_input, mask_y)
         
+        # --- THIS IS THE FIX ---
+        # Expand action_x to a 3D tensor to be used as an index for the 3D mask_for_o
+        index = action_x.unsqueeze(2).expand(-1, -1, self.base.length)
+        y_mask = torch.gather(mask_for_o, 1, index).squeeze(1).float()
+        # --- END FIX ---
+
+        dist_y, _, _ = self.dist_y(y_input, y_mask)
         action_y = dist_y.mode() if deterministic else dist_y.sample()
 
-        # 4. Combine actions and log probabilities
         log_prob_o = dist_o.log_prob(action_o.squeeze(-1))
         log_prob_x = dist_x.log_prob(action_x.squeeze(-1))
         log_prob_y = dist_y.log_prob(action_y.squeeze(-1))
         action_log_probs = (log_prob_o + log_prob_x + log_prob_y).unsqueeze(-1)
         
         action = torch.cat([action_o, action_x, action_y], dim=1)
+        return value, action, action_log_probs, rnn_hs
 
-        return value, action, action_log_probs, rnn_hxs
-
-    def evaluate_actions(self, inputs, rnn_hxs, masks, action, gt_masks):
-        value, actor_features, rnn_hxs = self.base(inputs, rnn_hxs, masks)
+    def evaluate_actions(self, inputs, rnn_hs, masks, action, gt_masks):
+        value, actor_features, rnn_hs = self.base(inputs, rnn_hs, masks)
         
         action_o, action_x, action_y = action[:, 0], action[:, 1], action[:, 2]
         
-        batch_size = actor_features.shape[0]
-        device = actor_features.device
-
-        # --- Distributions and Probabilities ---
-        mask_o = torch.ones(batch_size, 2).to(device)
-        dist_o, _, _ = self.dist_o(actor_features, mask_o)
+        mask_o0 = gt_masks[:, 0, :, :]
+        mask_o1 = gt_masks[:, 1, :, :]
+        o_mask_0_valid = mask_o0.any(dim=(-1,-2)).float()
+        o_mask_1_valid = mask_o1.any(dim=(-1,-2)).float()
+        o_mask = torch.stack([o_mask_0_valid, o_mask_1_valid], dim=1)
+        dist_o, _, _ = self.dist_o(actor_features, o_mask)
 
         o_one_hot = F.one_hot(action_o, num_classes=2).float()
         x_input = torch.cat([actor_features, o_one_hot], dim=1)
-        mask_x = torch.ones(batch_size, self.base.width).to(device)
-        dist_x, _, _ = self.dist_x(x_input, mask_x)
+        
+        condition = (action_o == 0).view(-1, 1, 1)
+        mask_for_o = torch.where(condition, mask_o0, mask_o1)
+        x_mask = mask_for_o.any(dim=-1).float()
+        dist_x, _, _ = self.dist_x(x_input, x_mask)
 
         x_one_hot = F.one_hot(action_x, num_classes=self.base.width).float()
         y_input = torch.cat([actor_features, o_one_hot, x_one_hot], dim=1)
-        mask_y = torch.ones(batch_size, self.base.length).to(device)
-        dist_y, _, _ = self.dist_y(y_input, mask_y)
-
-        # --- E_inf CALCULATION ---
-        # Get the full probability distributions for x and y
-        probs_x = dist_x.probs
-        probs_y = dist_y.probs
         
-        # Approximate the joint probability P(x, y | o) as P(x|o) * P(y|o,x) ~= P(x) * P(y)
-        # This gives a probability map for every (x,y) location
-        prob_map = probs_x.unsqueeze(2) * probs_y.unsqueeze(1) # Shape: (batch, width, length)
-
-        # Select the ground-truth feasibility mask for the chosen orientation
+        # --- THIS IS THE FIX ---
+        # Reshape the 1D action_x tensor to 3D to be used as an index
+        index = action_x.view(-1, 1, 1).expand(-1, 1, self.base.length)
+        y_mask = torch.gather(mask_for_o, 1, index).squeeze(1).float()
+        # --- END FIX ---
+        
+        dist_y, _, _ = self.dist_y(y_input, y_mask)
+        
+        probs_x, probs_y = dist_x.probs, dist_y.probs
+        prob_map = probs_x.unsqueeze(2) * probs_y.unsqueeze(1)
         mask_for_chosen_o = torch.gather(gt_masks, 1, action_o.view(-1, 1, 1, 1).expand(-1, 1, self.base.width, self.base.length)).squeeze(1)
-        
-        # The infeasibility mask is the inverse of the feasibility mask
         infeasibility_mask = 1.0 - mask_for_chosen_o
-        
-        # E_inf is the sum of probabilities at all infeasible locations
-        infeasibility_loss = (prob_map * infeasibility_mask).sum() / batch_size
+        infeasibility_loss = (prob_map * infeasibility_mask).sum() / actor_features.size(0)
 
-        # --- Original Calculations ---
         action_log_probs = dist_o.log_prob(action_o) + dist_x.log_prob(action_x) + dist_y.log_prob(action_y)
         dist_entropy = dist_o.entropy().mean() + dist_x.entropy().mean() + dist_y.entropy().mean()
-
-        # Return the new loss term
-        return value, action_log_probs, dist_entropy, rnn_hxs, infeasibility_loss
+        
+        return value, action_log_probs, dist_entropy, rnn_hs, infeasibility_loss
 
 class NNBase(nn.Module):
     # ... (This class is unchanged) ...
