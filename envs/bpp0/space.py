@@ -28,11 +28,15 @@ class Space(object):
 
         # --- Original logic continues below ---
         footprint = np.ones((item_x, item_y))
+        # TODO: fix the max filter convention to be equal to the  prediction convention
         max_h_map = maximum_filter(self.plain, footprint=footprint, mode="constant", cval=0)
         
         # This check is for overpacking (sticking out the top)
         vertically_feasible_mask = (max_h_map + item_z) <= self.height
-        
+        # TODO: fix this hack to avoid leftmost column and bottom row to be feasible.
+        vertically_feasible_mask[:, 0] = False
+        vertically_feasible_mask[-1, :] = False        
+        vertically_feasible_mask[:, -1] = False  
         candidate_coords = np.argwhere(vertically_feasible_mask)
         feasibility_map = np.zeros_like(self.plain, dtype=bool)
         
