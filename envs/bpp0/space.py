@@ -18,45 +18,30 @@ class Space(object):
         self.stacking_tree = StackingTree()
 
     def get_stability_map(self, item_size, density=1.0):
-        """
-        Generates a 2D map indicating all stable placement positions for a new item.
-        """
         item_x, item_y, item_z = item_size
 
-        # 1. Efficiently find the height of the surface at every possible placement location
+        # --- NEW, CRITICAL FIX ---
+        # If the item is larger than the bin in any dimension, it's impossible to place.
+        if item_x > self.width or item_y > self.length or item_z > self.height:
+            # Return a mask of all False, indicating no valid placements.
+            return np.zeros_like(self.plain, dtype=bool)
+
+        # --- Original logic continues below ---
         footprint = np.ones((item_x, item_y))
-        max_h_map = maximum_filter(
-            self.plain, footprint=footprint, mode="constant", cval=0
-        )
-
-        # 2. Find all positions that are vertically feasible (the overpacking check)
+        max_h_map = maximum_filter(self.plain, footprint=footprint, mode="constant", cval=0)
+        
+        # This check is for overpacking (sticking out the top)
         vertically_feasible_mask = (max_h_map + item_z) <= self.height
-
-        # 3. Iterate through only the feasible candidates to check for structural stability
+        
         candidate_coords = np.argwhere(vertically_feasible_mask)
         feasibility_map = np.zeros_like(self.plain, dtype=bool)
-
-        # Create a single reusable box object to avoid overhead in the loop
-        hypothetical_box = Box(
-            box_id=None, x=item_x, y=item_y, z=0, lx=0, ly=0, lz=item_z, density=density
-        )
-
+        
+        hypo_box = Box(box_id=None, x=0, y=0, z=0, lx=item_x, ly=item_y, lz=item_z, density=density)
         for r, c in candidate_coords:
-            placement_height = max_h_map[r, c]
-
-            # Update the hypothetical box with the current candidate's properties
-            hypothetical_box.z = placement_height
-            hypothetical_box.lx = r
-            hypothetical_box.ly = c
-            hypothetical_box.centroid[0] = r + item_x / 2.0
-            hypothetical_box.centroid[1] = c + item_y / 2.0
-
-            # Use the stacking tree to check for full structural stability
-            if self.stacking_tree.is_placement_stable(
-                hypothetical_box, self.stacking_tree.boxes
-            ):
+            hypo_box.z=max_h_map[r,c]; hypo_box.x=r; hypo_box.y=c
+            hypo_box.centroid[0]=r+item_x/2.0; hypo_box.centroid[1]=c+item_y/2.0
+            if self.stacking_tree.is_placement_stable(hypo_box, self.stacking_tree.boxes):
                 feasibility_map[r, c] = True
-
         return feasibility_map
 
     def drop_box(self, box_size, position, flag, density=1.0):
