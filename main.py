@@ -61,6 +61,7 @@ def train_model(args):
         envs.action_space,
         base_kwargs={"recurrent": False, "hidden_size": args.hidden_size},
     )
+    actor_critic = torch.compile(actor_critic)
     actor_critic.to(device)
 
     agent = algo.ACKTR(

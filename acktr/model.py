@@ -163,8 +163,8 @@ class CNNPro(NNBase):
 
         init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.constant_(x, 0), nn.init.calculate_gain('leaky_relu'))
         
-        # Shared CNN feature extractor
-        self.main = nn.Sequential(
+        # 1. Shared convolutional feature extractor (no dense layers)
+        self.shared_conv = nn.Sequential(
             init_(nn.Conv2d(num_inputs, 64, 3, stride=1, padding=1)),
             nn.LeakyReLU(),
             init_(nn.Conv2d(64, 64, 3, stride=1, padding=1)),
@@ -174,28 +174,49 @@ class CNNPro(NNBase):
             init_(nn.Conv2d(64, 64, 3, stride=1, padding=1)),
             nn.LeakyReLU(),
             init_(nn.Conv2d(64, 64, 3, stride=1, padding=1)),
-            nn.LeakyReLU(),
-            Flatten(),
-            init_(nn.Linear(64 * width * length, hidden_size)),
             nn.LeakyReLU()
         )
 
-        # Critic head
+        # 2. Actor head with its own dimensionality reduction
+        self.actor_head = nn.Sequential(
+            # Use a 1x1 Conv to reduce channels from 64 to 8
+            init_(nn.Conv2d(64, 8, 1, stride=1)),
+            nn.LeakyReLU(),
+            Flatten(),
+            # The input dimension is now small: 8 * width * length
+            init_(nn.Linear(8 * width * length, hidden_size)),
+            nn.LeakyReLU()
+        )
+
+        # 3. Critic head with its own dimensionality reduction
+        self.critic_head = nn.Sequential(
+            # Use a 1x1 Conv to reduce channels from 64 to 4
+            init_(nn.Conv2d(64, 4, 1, stride=1)),
+            nn.LeakyReLU(),
+            Flatten(),
+            # The input dimension is now small: 4 * width * length
+            init_(nn.Linear(4 * width * length, hidden_size))
+        )
+
+        # Final linear layer for the critic value
         self.critic_linear = init_(nn.Linear(hidden_size, 1))
-        
-        # ### --- REMOVED --- ###
-        # The actor heads are now in the Policy class.
         
         self.train()
 
     def forward(self, inputs, rnn_hxs, masks):
+        # Reshape the input
         x = inputs.view(-1, 6, self.width, self.length)
         
-        # Get shared features from the main body
-        actor_features = self.main(x)
+        # --- New Data Flow ---
+        # 1. Get features from the shared convolutional base
+        shared_features = self.shared_conv(x)
         
-        # Compute critic value
-        value = self.critic_linear(actor_features)
+        # 2. Process through the actor head to get features for the policy
+        actor_features = self.actor_head(shared_features)
+        
+        # 3. Process through the critic head to get the value
+        critic_features = self.critic_head(shared_features)
+        value = self.critic_linear(critic_features)
 
-        # Return value and shared features for the actor
+        # Return the same outputs as before
         return value, actor_features, rnn_hxs

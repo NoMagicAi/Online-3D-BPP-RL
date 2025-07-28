@@ -5,6 +5,53 @@ from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 def _flatten_helper(T, N, _tensor):
     return _tensor.view(T * N, *_tensor.size()[2:])
 
+
+# --- START OF MODIFICATION ---
+# The logic from `compute_returns` is extracted into a standalone function.
+# We apply the torch.compile decorator here for optimization.
+# The mode 'reduce-overhead' is ideal for this kind of loop-heavy function.
+@torch.compile(mode="reduce-overhead")
+def _compute_returns_compiled(
+    rewards, value_preds, masks, bad_masks,
+    use_gae, gamma, gae_lambda, use_proper_time_limits
+):
+    """
+    A compiled, standalone version of the GAE and return calculation logic.
+    """
+    num_steps = rewards.size(0)
+    # The returns tensor is created here and will be returned.
+    # It has the same size as value_preds (num_steps + 1).
+    returns = torch.zeros_like(value_preds)
+
+    if use_proper_time_limits:
+        if use_gae:
+            gae = 0
+            for step in reversed(range(num_steps)):
+                delta = rewards[step] + gamma * value_preds[step + 1] * masks[step + 1] - value_preds[step]
+                gae = delta + gamma * gae_lambda * masks[step + 1] * gae
+                gae = gae * bad_masks[step + 1]
+                returns[step] = gae + value_preds[step]
+        else: # Not using GAE
+            returns[-1] = value_preds[-1]
+            for step in reversed(range(num_steps)):
+                returns[step] = (returns[step + 1] * gamma * masks[step + 1] + rewards[step]) * bad_masks[step + 1] \
+                                + (1 - bad_masks[step + 1]) * value_preds[step]
+    else: # Not using proper time limits
+        if use_gae:
+            gae = 0
+            for step in reversed(range(num_steps)):
+                delta = rewards[step] + gamma * value_preds[step + 1] * masks[step + 1] - value_preds[step]
+                gae = delta + gamma * gae_lambda * masks[step + 1] * gae
+                returns[step] = gae + value_preds[step]
+        else: # Not using GAE
+            returns[-1] = value_preds[-1]
+            for step in reversed(range(num_steps)):
+                returns[step] = returns[step + 1] * gamma * masks[step + 1] + rewards[step]
+
+    return returns
+# --- END OF MODIFICATION ---
+
+
 # the shape of observation: batch * cpu * length
 class RolloutStorage(object):
     def __init__(self, num_steps, num_processes, obs_shape, action_space,
@@ -82,46 +129,30 @@ class RolloutStorage(object):
         self.bad_masks[0].copy_(self.bad_masks[-1])
         self.location_masks[0].copy_(self.location_masks[-1])
 
+    # --- START OF MODIFICATION ---
     def compute_returns(self,
                         next_value,
                         use_gae,
                         gamma,
                         gae_lambda,
                         use_proper_time_limits=True):
-        if use_proper_time_limits:
-            if use_gae:
-                self.value_preds[-1] = next_value
-                gae = 0
-                for step in reversed(range(self.rewards.size(0))):
-                    delta = self.rewards[step] + gamma * self.value_preds[
-                        step + 1] * self.masks[step +
-                                               1] - self.value_preds[step]
-                    gae = delta + gamma * gae_lambda * self.masks[step +
-                                                                  1] * gae
-                    gae = gae * self.bad_masks[step + 1]
-                    self.returns[step] = gae + self.value_preds[step]
-            else:
-                self.returns[-1] = next_value
-                for step in reversed(range(self.rewards.size(0))):
-                    self.returns[step] = (self.returns[step + 1] * \
-                        gamma * self.masks[step + 1] + self.rewards[step]) * self.bad_masks[step + 1] \
-                        + (1 - self.bad_masks[step + 1]) * self.value_preds[step]
-        else:
-            if use_gae:
-                self.value_preds[-1] = next_value
-                gae = 0
-                for step in reversed(range(self.rewards.size(0))):
-                    delta = self.rewards[step] + gamma * self.value_preds[
-                        step + 1] * self.masks[step +
-                                               1] - self.value_preds[step]
-                    gae = delta + gamma * gae_lambda * self.masks[step +
-                                                                  1] * gae
-                    self.returns[step] = gae + self.value_preds[step]
-            else:
-                self.returns[-1] = next_value#
-                for step in reversed(range(self.rewards.size(0))):
-                    self.returns[step] = self.returns[step + 1] * \
-                        gamma * self.masks[step + 1] + self.rewards[step]
+        
+        # We set the final value prediction, which is needed for the calculation.
+        self.value_preds[-1] = next_value
+        
+        # We now call the optimized, standalone function, passing the required tensors
+        # from self as arguments. The result overwrites the instance's returns tensor.
+        self.returns = _compute_returns_compiled(
+            self.rewards,
+            self.value_preds,
+            self.masks,
+            self.bad_masks,
+            use_gae,
+            gamma,
+            gae_lambda,
+            use_proper_time_limits
+        )
+    # --- END OF MODIFICATION ---
 
     def feed_forward_generator(self,
                                advantages,
@@ -214,7 +245,7 @@ class RolloutStorage(object):
             return_batch = _flatten_helper(T, N, return_batch)
             masks_batch = _flatten_helper(T, N, masks_batch)
             old_action_log_probs_batch = _flatten_helper(T, N, \
-                    old_action_log_probs_batch)
+                        old_action_log_probs_batch)
             adv_targ = _flatten_helper(T, N, adv_targ)
 
             yield obs_batch, recurrent_hidden_states_batch, actions_batch, \

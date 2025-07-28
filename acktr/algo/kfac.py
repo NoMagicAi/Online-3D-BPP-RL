@@ -1,3 +1,4 @@
+import time
 import math
 import torch
 import torch.nn as nn
@@ -6,16 +7,14 @@ import torch.optim as optim
 
 from acktr.utils import AddBias
 
-# TODO: In order to make this code faster:
-# 1) Implement _extract_patches as a single cuda kernel
-# 2) Compute QR decomposition in a separate process
-# 3) Actually make a general KFAC optimizer so it fits PyTorch
+# --- START OF MODIFICATION ---
 
-
+@torch.compile(mode="reduce-overhead")
 def _extract_patches(x, kernel_size, stride, padding):
+    """This function is pure tensor manipulation and a great candidate for compilation."""
     if padding[0] + padding[1] > 0:
         x = F.pad(x, (padding[1], padding[1], padding[0],
-                      padding[0])).data  # Actually check dims
+                      padding[0])).data
     x = x.unfold(2, kernel_size[0], stride[0])
     x = x.unfold(3, kernel_size[1], stride[1])
     x = x.transpose_(1, 2).transpose_(2, 3).contiguous()
@@ -24,8 +23,9 @@ def _extract_patches(x, kernel_size, stride, padding):
         x.size(3) * x.size(4) * x.size(5))
     return x
 
-
+@torch.compile(mode="reduce-overhead")
 def compute_cov_a(a, classname, layer_info, fast_cnn):
+    """Compiling this function will fuse its internal logic and matrix multiplication."""
     batch_size = a.size(0)
 
     if classname == 'Conv2d':
@@ -44,8 +44,9 @@ def compute_cov_a(a, classname, layer_info, fast_cnn):
 
     return a.t() @ (a / batch_size)
 
-
+@torch.compile(mode="reduce-overhead")
 def compute_cov_g(g, classname, layer_info, fast_cnn):
+    """Compiling this function will also fuse its internal logic and matrix multiplication."""
     batch_size = g.size(0)
 
     if classname == 'Conv2d':
@@ -62,13 +63,12 @@ def compute_cov_g(g, classname, layer_info, fast_cnn):
     g_ = g * batch_size
     return g_.t() @ (g_ / g.size(0))
 
+# --- END OF MODIFICATION ---
 
 def update_running_stat(aa, m_aa, momentum):
-    # Do the trick to keep aa unchanged and not create any additional tensors
     m_aa *= momentum / (1 - momentum)
     m_aa += aa
     m_aa *= (1 - momentum)
-
 
 class SplitBias(nn.Module):
     def __init__(self, module):
@@ -82,11 +82,6 @@ class SplitBias(nn.Module):
         x = self.add_bias(x)
         return x
 
-# def check_nan(model,index):
-#     for p in model.parameters():
-#         if np.isnan(p.grad.data.mean().item()):
-#             print('index '+ str(index) +' happened an error!')
-
 class KFACOptimizer(optim.Optimizer):
     def __init__(self,
                  model,
@@ -98,7 +93,8 @@ class KFACOptimizer(optim.Optimizer):
                  weight_decay=0,
                  fast_cnn=False,
                  Ts=1,
-                 Tf=10):
+                 Tf=10,
+                 kfac_approx_rank=64): # Rank of the approximation, None for exact eigh
         defaults = dict()
 
         def split_bias(module):
@@ -133,6 +129,8 @@ class KFACOptimizer(optim.Optimizer):
         self.kl_clip = kl_clip
         self.damping = damping
         self.weight_decay = weight_decay
+        
+        self.kfac_approx_rank = kfac_approx_rank
 
         self.fast_cnn = fast_cnn
 
@@ -155,14 +153,12 @@ class KFACOptimizer(optim.Optimizer):
             aa = compute_cov_a(input[0].data, classname, layer_info,
                                self.fast_cnn)
 
-            # Initialize buffers
             if self.steps == 0:
                 self.m_aa[module] = aa.clone()
 
             update_running_stat(aa, self.m_aa[module], self.stat_decay)
 
     def _save_grad_output(self, module, grad_input, grad_output):
-        # Accumulate statistics for Fisher matrices
         if self.acc_stats:
             classname = module.__class__.__name__
             layer_info = None
@@ -173,7 +169,6 @@ class KFACOptimizer(optim.Optimizer):
             gg = compute_cov_g(grad_output[0].data, classname, layer_info,
                                self.fast_cnn)
 
-            # Initialize buffers
             if self.steps == 0:
                 self.m_gg[module] = gg.clone()
 
@@ -184,19 +179,18 @@ class KFACOptimizer(optim.Optimizer):
             classname = module.__class__.__name__
             if classname in self.known_modules:
                 assert not ((classname in ['Linear', 'Conv2d']) and module.bias is not None), \
-                                    "You must have a bias as a separate layer"
+                                       "You must have a bias as a separate layer"
 
                 self.modules.append(module)
                 module.register_forward_pre_hook(self._save_input)
                 module.register_backward_hook(self._save_grad_output)
 
     def step(self):
-        # Add weight decay
+        start_time = time.perf_counter()
         if self.weight_decay > 0:
             for p in self.model.parameters():
                 p.grad.data.add_(self.weight_decay, p.data)
 
-        # error happens
         updates = {}
         for i, m in enumerate(self.modules):
             assert len(list(m.parameters())
@@ -207,13 +201,24 @@ class KFACOptimizer(optim.Optimizer):
             la = self.damping + self.weight_decay
 
             if self.steps % self.Tf == 0:
-                # My asynchronous implementation exists, I will add it later.
-                # Experimenting with different ways to this in PyTorch.
+                # --- MODIFIED: Use torch.svd_lowrank for efficiency ---
+                if self.kfac_approx_rank is not None:
+                    # Use fast, approximate method with svd_lowrank.
+                    # For a symmetric matrix A, its SVD (U, S, V) is equivalent
+                    # to its eigendecomposition (Q, D, Q.T), where U=V=Q
+                    # (eigenvectors) and S=abs(D) (eigenvalues).
+                    # Since covariance matrices are positive semi-definite, S=D.
+                    U_g, S_g, _ = torch.svd_lowrank(self.m_gg[m], q=self.kfac_approx_rank)
+                    self.d_g[m] = S_g # eigenvalues
+                    self.Q_g[m] = U_g # eigenvectors
 
-                self.d_g[m], self.Q_g[m] = torch.linalg.eigh(
-                    self.m_gg[m])
-                self.d_a[m], self.Q_a[m] = torch.linalg.eigh(
-                    self.m_aa[m])
+                    U_a, S_a, _ = torch.svd_lowrank(self.m_aa[m], q=self.kfac_approx_rank)
+                    self.d_a[m] = S_a # eigenvalues
+                    self.Q_a[m] = U_a # eigenvectors
+                else:
+                    # Use exact, slow method
+                    self.d_g[m], self.Q_g[m] = torch.linalg.eigh(self.m_gg[m])
+                    self.d_a[m], self.Q_a[m] = torch.linalg.eigh(self.m_aa[m])
 
                 self.d_a[m].mul_((self.d_a[m] > 1e-6).float())
                 self.d_g[m].mul_((self.d_g[m] > 1e-6).float())
@@ -235,24 +240,21 @@ class KFACOptimizer(optim.Optimizer):
             v = v.view(p.grad.data.size())
             updates[p] = v
 
-
         vg_sum = 0
-
         for p in self.model.parameters():
-            # if len(p.size())>=3:
-            #     continue
             v = updates[p]
             vg_sum += (v * p.grad.data * self.lr * self.lr).sum()
-
 
         nu = min(1, math.sqrt(self.kl_clip / vg_sum))
 
         for p in self.model.parameters():
-            # if len(p.size())>=3:
-            #     continue
             v = updates[p]
             p.grad.data.copy_(v)
             p.grad.data.mul_(nu)
 
         self.optim.step()
         self.steps += 1
+        end_time = time.perf_counter()
+        elapsed_time = end_time - start_time
+
+        print(f"Execution time: {elapsed_time:.6f} seconds")
