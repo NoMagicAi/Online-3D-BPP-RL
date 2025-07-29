@@ -1,0 +1,312 @@
+import time
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+
+from acktr.utils import AddBias
+
+# --- START OF MODIFICATION ---
+
+@torch.compile(mode="reduce-overhead")
+def _extract_patches(x, kernel_size, stride, padding):
+    """This function is pure tensor manipulation and a great candidate for compilation."""
+    if padding[0] + padding[1] > 0:
+        x = F.pad(x, (padding[1], padding[1], padding[0],
+                      padding[0])).data
+    x = x.unfold(2, kernel_size[0], stride[0])
+    x = x.unfold(3, kernel_size[1], stride[1])
+    x = x.transpose_(1, 2).transpose_(2, 3).contiguous()
+    x = x.view(
+        x.size(0), x.size(1), x.size(2),
+        x.size(3) * x.size(4) * x.size(5))
+    return x
+
+@torch.compile(mode="reduce-overhead")
+def compute_cov_a(a, classname, layer_info, fast_cnn):
+    """Compiling this function will fuse its internal logic and matrix multiplication."""
+    batch_size = a.size(0)
+
+    if classname == 'Conv2d':
+        kernel_size, stride, padding, groups = layer_info
+        
+        # Extract patches
+        a = _extract_patches(a, kernel_size, stride, padding)
+        
+        if fast_cnn:
+            # Spatial average, shape: (N, C_in*k*k)
+            a = a.view(a.size(0), -1, a.size(-1)).mean(1)
+        else:
+            # Reshape to (N*H_out*W_out, C_in*k*k)
+            a = a.view(-1, a.size(-1))
+            # Average over spatial locations, shape: (N, C_in*k*k)
+            a = a.view(batch_size, -1, a.size(-1)).mean(1)
+
+        if groups > 1:
+            # Handle grouped convolutions
+            # Reshape to (N, G, (C_in/G)*k*k)
+            a = a.view(batch_size, groups, -1)
+            # Transpose for bmm: (G, N, (C_in/G)*k*k)
+            a = a.transpose(0, 1)
+            # Batched covariance computation: (G, D_a, D_a)
+            cov_a = torch.bmm(a.transpose(1, 2), a / batch_size)
+        else:
+            # Original logic for non-grouped conv
+            cov_a = a.t() @ (a / batch_size)
+        
+    elif classname == 'AddBias':
+        is_cuda = a.is_cuda
+        a = torch.ones(a.size(0), 1)
+        if is_cuda:
+            a = a.cuda()
+        cov_a = a.t() @ (a / batch_size)
+        
+    else: # Linear
+        cov_a = a.t() @ (a / batch_size)
+
+    return cov_a
+
+
+@torch.compile(mode="reduce-overhead")
+def compute_cov_g(g, classname, layer_info, fast_cnn):
+    """Compiling this function will also fuse its internal logic and matrix multiplication."""
+    batch_size = g.size(0)
+
+    if classname == 'Conv2d':
+        _, _, _, groups = layer_info
+        # g has shape (N, C_out, H_out, W_out)
+        spatial_size = g.size(2) * g.size(3)
+        
+        if fast_cnn:
+            # Sum over spatial locations, shape: (N, C_out)
+            g = g.sum(dim=(2, 3))
+        else:
+            # Reshape to (N, C_out, H_out*W_out) -> (N*H_out*W_out, C_out)
+            g = g.transpose(1, 2).transpose(2, 3).contiguous()
+            g = g.view(-1, g.size(-1)) # Shape (M, C_out) where M = N*H*W
+            g = g * spatial_size # Scale by number of locations, a KFAC trick
+
+        if groups > 1:
+            # Handle grouped convolutions
+            # Reshape to (N or M, G, C_out/G)
+            g = g.view(-1, groups, g.size(-1) // groups)
+            # Transpose for bmm: (G, N or M, C_out/G)
+            g = g.transpose(0, 1)
+            
+            # g_ is scaled by batch_size for the final computation
+            g_ = g * batch_size
+            # Batched covariance computation: (G, D_g, D_g)
+            cov_g = torch.bmm(g_.transpose(1, 2), g_ / g.size(1))
+        else:
+            # Original logic for non-grouped conv
+            g_ = g * batch_size
+            cov_g = g_.t() @ (g_ / g.size(0))
+
+    elif classname == 'AddBias':
+        g = g.view(g.size(0), g.size(1), -1)
+        g = g.sum(-1)
+        g_ = g * batch_size
+        cov_g = g_.t() @ (g_ / g.size(0))
+
+    else: # Linear
+        g_ = g * batch_size
+        cov_g = g_.t() @ (g_ / g.size(0))
+        
+    return cov_g
+
+# --- END OF MODIFICATION ---
+
+def update_running_stat(aa, m_aa, momentum):
+    m_aa *= momentum / (1 - momentum)
+    m_aa += aa
+    m_aa *= (1 - momentum)
+
+class SplitBias(nn.Module):
+    def __init__(self, module):
+        super(SplitBias, self).__init__()
+        self.module = module
+        self.add_bias = AddBias(module.bias.data)
+        self.module.bias = None
+
+    def forward(self, input):
+        x = self.module(input)
+        x = self.add_bias(x)
+        return x
+
+class KFACOptimizer(optim.Optimizer):
+    def __init__(self,
+                 model,
+                 lr=0.25,
+                 momentum=0.9,
+                 stat_decay=0.99,
+                 kl_clip=0.001,
+                 damping=1e-2,
+                 weight_decay=0,
+                 fast_cnn=False,
+                 Ts=1,
+                 Tf=10,
+                 kfac_approx_rank=64): # Rank of the approximation, None for exact eigh
+        defaults = dict()
+
+        def split_bias(module):
+            for mname, child in module.named_children():
+                if hasattr(child, 'bias') and child.bias is not None:
+                    module._modules[mname] = SplitBias(child)
+                else:
+                    split_bias(child)
+
+        split_bias(model)
+
+        super(KFACOptimizer, self).__init__(model.parameters(), defaults)
+
+        self.known_modules = {'Linear', 'Conv2d', 'AddBias'}
+
+        self.modules = []
+        self.grad_outputs = {}
+
+        self.model = model
+        self._prepare_model()
+
+        self.steps = 0
+
+        self.m_aa, self.m_gg = {}, {}
+        self.Q_a, self.Q_g = {}, {}
+        self.d_a, self.d_g = {}, {}
+
+        self.momentum = momentum
+        self.stat_decay = stat_decay
+
+        self.lr = lr
+        self.kl_clip = kl_clip
+        self.damping = damping
+        self.weight_decay = weight_decay
+        
+        self.kfac_approx_rank = kfac_approx_rank
+
+        self.fast_cnn = fast_cnn
+
+        self.Ts = Ts
+        self.Tf = Tf
+
+        self.optim = optim.SGD(
+            model.parameters(),
+            lr=self.lr * (1 - self.momentum),
+            momentum=self.momentum)
+
+    def _save_input(self, module, input):
+        if torch.is_grad_enabled() and self.steps % self.Ts == 0:
+            classname = module.__class__.__name__
+            layer_info = None
+            if classname == 'Conv2d':
+                layer_info = (module.kernel_size, module.stride,
+                              module.padding, module.groups) # MODIFIED: Add groups
+
+            aa = compute_cov_a(input[0].data, classname, layer_info,
+                               self.fast_cnn)
+
+            if self.steps == 0:
+                self.m_aa[module] = aa.clone()
+
+            update_running_stat(aa, self.m_aa[module], self.stat_decay)
+
+    def _save_grad_output(self, module, grad_input, grad_output):
+        if self.acc_stats:
+            classname = module.__class__.__name__
+            layer_info = None
+            if classname == 'Conv2d':
+                layer_info = (module.kernel_size, module.stride,
+                              module.padding, module.groups) # MODIFIED: Add groups
+
+            gg = compute_cov_g(grad_output[0].data, classname, layer_info,
+                               self.fast_cnn)
+
+            if self.steps == 0:
+                self.m_gg[module] = gg.clone()
+
+            update_running_stat(gg, self.m_gg[module], self.stat_decay)
+
+    def _prepare_model(self):
+        for module in self.model.modules():
+            classname = module.__class__.__name__
+            if classname in self.known_modules:
+                assert not ((classname in ['Linear', 'Conv2d']) and module.bias is not None), \
+                                       "You must have a bias as a separate layer"
+
+                self.modules.append(module)
+                module.register_forward_pre_hook(self._save_input)
+                module.register_backward_hook(self._save_grad_output)
+
+    def step(self):
+        start_time = time.perf_counter()
+        if self.weight_decay > 0:
+            for p in self.model.parameters():
+                p.grad.data.add_(self.weight_decay, p.data)
+
+        updates = {}
+        for i, m in enumerate(self.modules):
+            assert len(list(m.parameters())
+                       ) == 1, "Can handle only one parameter at the moment"
+            classname = m.__class__.__name__
+            p = next(m.parameters())
+
+            la = self.damping + self.weight_decay
+
+            if self.steps % self.Tf == 0:
+                # --- MODIFIED: Use torch.svd_lowrank for efficiency ---
+                if self.kfac_approx_rank is not None:
+                    # Use fast, approximate method with svd_lowrank.
+                    # For a symmetric matrix A, its SVD (U, S, V) is equivalent
+                    # to its eigendecomposition (Q, D, Q.T), where U=V=Q
+                    # (eigenvectors) and S=abs(D) (eigenvalues).
+                    # Since covariance matrices are positive semi-definite, S=D.
+                    U_g, S_g, _ = torch.svd_lowrank(self.m_gg[m], q=self.kfac_approx_rank)
+                    self.d_g[m] = S_g # eigenvalues
+                    self.Q_g[m] = U_g # eigenvectors
+
+                    U_a, S_a, _ = torch.svd_lowrank(self.m_aa[m], q=self.kfac_approx_rank)
+                    self.d_a[m] = S_a # eigenvalues
+                    self.Q_a[m] = U_a # eigenvectors
+                else:
+                    # Use exact, slow method
+                    self.d_g[m], self.Q_g[m] = torch.linalg.eigh(self.m_gg[m])
+                    self.d_a[m], self.Q_a[m] = torch.linalg.eigh(self.m_aa[m])
+
+                self.d_a[m].mul_((self.d_a[m] > 1e-6).float())
+                self.d_g[m].mul_((self.d_g[m] > 1e-6).float())
+
+            if classname == 'Conv2d' or classname == 'ConvTranspose2d':
+                p_grad_mat = p.grad.data.view(p.grad.data.size(0), -1)
+            else:
+                p_grad_mat = p.grad.data
+
+            if self.Q_a[m].device != self.Q_g[m].device:
+                self.Q_a[m]=self.Q_a[m].to(self.Q_g[m].device)
+                self.d_a[m]=self.d_a[m].to(self.Q_g[m].device)
+
+            v1 = self.Q_g[m].t() @ p_grad_mat @ self.Q_a[m]
+            v2 = v1 / (
+                self.d_g[m].unsqueeze(1) * self.d_a[m].unsqueeze(0) + la)
+            v = self.Q_g[m] @ v2 @ self.Q_a[m].t()
+
+            v = v.view(p.grad.data.size())
+            updates[p] = v
+
+        vg_sum = 0
+        for p in self.model.parameters():
+            v = updates[p]
+            vg_sum += (v * p.grad.data * self.lr * self.lr).sum()
+
+        nu = min(1, math.sqrt(self.kl_clip / vg_sum))
+
+        for p in self.model.parameters():
+            v = updates[p]
+            p.grad.data.copy_(v)
+            p.grad.data.mul_(nu)
+
+        self.optim.step()
+        self.steps += 1
+        end_time = time.perf_counter()
+        elapsed_time = end_time - start_time
+
+        print(f"Execution time: {elapsed_time:.6f} seconds")
