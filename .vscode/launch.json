@@ -11,7 +11,7 @@
             "request": "launch",
             "program": "main.py",
             "console": "integratedTerminal",
-            "args": "--container_size 10 10 10 --item-size-range 5 5 5 5 5 5 --item-seq rs --num_steps 128 --log_interval 5 --num_processes 16"
+            "args": "--container_size 16 16 16 --item-size-range 8 8 8 8 8 8 --item-seq rs --num_steps 128 --log_interval 5 --num_processes 16"
         },
         {
             "name": "Training 2",

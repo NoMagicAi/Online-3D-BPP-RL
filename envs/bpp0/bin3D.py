@@ -3,6 +3,7 @@
 import random
 import numpy as np
 import gym
+import time
 
 from .space import Space
 from .cutCreator import CuttingBoxCreator
@@ -138,8 +139,10 @@ class PackingGame(gym.Env):
             # Advance the item queue and compute masks for the *next* state
             self.box_creator.drop_box()
             self.box_creator.generate_box_size()
+            start_time = time.perf_counter()
             self._update_masks()
-
+            end_time = time.perf_counter()
+            print(f"Updating mask: {end_time - start_time} seconds")
             # Check if the new state is terminal
             done = not (self.mask_o0.any() or self.mask_o1.any())
         else:

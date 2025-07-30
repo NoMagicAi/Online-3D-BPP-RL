@@ -1,6 +1,6 @@
 import torch
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
-
+import time
 
 def _flatten_helper(T, N, _tensor):
     return _tensor.view(T * N, *_tensor.size()[2:])
@@ -12,44 +12,39 @@ def _flatten_helper(T, N, _tensor):
 # The mode 'reduce-overhead' is ideal for this kind of loop-heavy function.
 @torch.compile(mode="reduce-overhead")
 def _compute_returns_compiled(
-    rewards, value_preds, masks, bad_masks,
-    use_gae, gamma, gae_lambda, use_proper_time_limits
-):
+    rewards: torch.Tensor,
+    value_preds: torch.Tensor,
+    masks: torch.Tensor,
+    bad_masks: torch.Tensor,
+    gamma: float,
+    gae_lambda: float,
+) -> torch.Tensor:
     """
-    A compiled, standalone version of the GAE and return calculation logic.
+    A compiled, optimized, and unified version of the GAE and return calculation logic.
+
+    To replicate the behavior of the original function's flags:
+    - For standard GAE (originally `use_gae=True`), pass your `gae_lambda` value.
+    - To disable GAE (originally `use_gae=False`), set `gae_lambda=1.0`.
+    - To use proper time limits (originally `use_proper_time_limits=True`), pass the correct `bad_masks`.
+    - To disable proper time limits (originally `use_proper_time_limits=False`), pass a tensor of ones for `bad_masks`.
     """
     num_steps = rewards.size(0)
-    # The returns tensor is created here and will be returned.
-    # It has the same size as value_preds (num_steps + 1).
     returns = torch.zeros_like(value_preds)
+    gae = 0.0
 
-    if use_proper_time_limits:
-        if use_gae:
-            gae = 0
-            for step in reversed(range(num_steps)):
-                delta = rewards[step] + gamma * value_preds[step + 1] * masks[step + 1] - value_preds[step]
-                gae = delta + gamma * gae_lambda * masks[step + 1] * gae
-                gae = gae * bad_masks[step + 1]
-                returns[step] = gae + value_preds[step]
-        else: # Not using GAE
-            returns[-1] = value_preds[-1]
-            for step in reversed(range(num_steps)):
-                returns[step] = (returns[step + 1] * gamma * masks[step + 1] + rewards[step]) * bad_masks[step + 1] \
-                                + (1 - bad_masks[step + 1]) * value_preds[step]
-    else: # Not using proper time limits
-        if use_gae:
-            gae = 0
-            for step in reversed(range(num_steps)):
-                delta = rewards[step] + gamma * value_preds[step + 1] * masks[step + 1] - value_preds[step]
-                gae = delta + gamma * gae_lambda * masks[step + 1] * gae
-                returns[step] = gae + value_preds[step]
-        else: # Not using GAE
-            returns[-1] = value_preds[-1]
-            for step in reversed(range(num_steps)):
-                returns[step] = returns[step + 1] * gamma * masks[step + 1] + rewards[step]
+    # Precompute deltas for the entire sequence to simplify the loop body
+    deltas = rewards + gamma * value_preds[1:] * masks[1:] - value_preds[:-1]
+
+    # Iterate backwards to compute GAE and returns
+    for step in reversed(range(num_steps)):
+        # This is the unified GAE update rule.
+        # The `bad_masks` correctly resets GAE at timeout-terminated episode boundaries.
+        # `gae` at the start of this line is the advantage from the next step (t+1).
+        gae = deltas[step] + gamma * gae_lambda * masks[step + 1] * gae
+        gae = gae * bad_masks[step + 1]
+        returns[step] = gae + value_preds[step]
 
     return returns
-# --- END OF MODIFICATION ---
 
 
 # the shape of observation: batch * cpu * length
@@ -130,29 +125,40 @@ class RolloutStorage(object):
         self.location_masks[0].copy_(self.location_masks[-1])
 
     # --- START OF MODIFICATION ---
-    def compute_returns(self,
-                        next_value,
-                        use_gae,
-                        gamma,
-                        gae_lambda,
-                        use_proper_time_limits=True):
-        
-        # We set the final value prediction, which is needed for the calculation.
+    def compute_returns(self, next_value, use_gae, gamma, gae_lambda, use_proper_time_limits):
+        """
+        Updates the logic to correctly call the new optimized function.
+        """
+        # The last value prediction is the value of the state after the final action
         self.value_preds[-1] = next_value
+
+        # --- START OF MODIFICATION ---
+
+        # If GAE is disabled, it's equivalent to setting lambda to 1.0.
+        current_gae_lambda = gae_lambda if use_gae else 1.0
+
+        # If not using proper time limits, we pass a tensor of all ones.
+        # This makes the bad_mask have no effect, as intended.
+        if use_proper_time_limits:
+            current_bad_masks = self.bad_masks
+        else:
+            current_bad_masks = torch.ones_like(self.bad_masks)
         
-        # We now call the optimized, standalone function, passing the required tensors
-        # from self as arguments. The result overwrites the instance's returns tensor.
+        # Call the compiled function with the correct 6 arguments
+        #start_time = time.perf_counter()
         self.returns = _compute_returns_compiled(
-            self.rewards,
-            self.value_preds,
-            self.masks,
-            self.bad_masks,
-            use_gae,
-            gamma,
-            gae_lambda,
-            use_proper_time_limits
+            rewards=self.rewards,
+            value_preds=self.value_preds,
+            masks=self.masks,
+            bad_masks=current_bad_masks,
+            gamma=gamma,
+            gae_lambda=current_gae_lambda
         )
-    # --- END OF MODIFICATION ---
+        # --- END OF MODIFICATION ---
+        #end_time = time.perf_counter()
+        #elapsed_time = end_time - start_time
+        #print(f"Time taken for compute returns: {elapsed_time} seconds")
+
 
     def feed_forward_generator(self,
                                advantages,

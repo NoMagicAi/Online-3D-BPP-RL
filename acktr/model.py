@@ -170,7 +170,7 @@ def init_(m):
     return m
 
 class CNNPro(NNBase):
-    def __init__(self, num_inputs, recurrent=False, hidden_size=512, width=10, length=10):
+    def __init__(self, num_inputs, recurrent=False, hidden_size=512, width=100, length=100):
         super(CNNPro, self).__init__(recurrent, num_inputs, hidden_size)
         
         self.width = width
@@ -178,74 +178,71 @@ class CNNPro(NNBase):
 
         init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.constant_(x, 0), nn.init.calculate_gain('leaky_relu'))
         
-        # 1. Shared convolutional feature extractor (no dense layers)
+        # 1. Define the shared convolutional feature extractor first
         self.shared_conv = nn.Sequential(
-            # First SeparableConv2d: num_inputs -> 64
-            init_(nn.Conv2d(num_inputs, num_inputs, kernel_size=3, stride=1, padding=1, groups=num_inputs, bias=False)), # Depthwise
-            init_(nn.Conv2d(num_inputs, 64, kernel_size=1, stride=1, padding=0, bias=False)), # Pointwise
+            # Block 1: stride 1
+            init_(nn.Conv2d(num_inputs, num_inputs, kernel_size=3, stride=1, padding=1, groups=num_inputs, bias=False)),
+            init_(nn.Conv2d(num_inputs, 64, kernel_size=1, stride=1, padding=0, bias=False)),
             nn.LeakyReLU(),
 
-            # Second SeparableConv2d: 64 -> 64
-            init_(nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, groups=64, bias=False)), # Depthwise
-            init_(nn.Conv2d(64, 64, kernel_size=1, stride=1, padding=0, bias=False)), # Pointwise
+            # Block 2: stride 2 (DOWNSAMPLE)
+            init_(nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1, groups=64, bias=False)),
+            init_(nn.Conv2d(64, 64, kernel_size=1, stride=1, padding=0, bias=False)),
             nn.LeakyReLU(),
 
-            # Third SeparableConv2d: 64 -> 64
-            init_(nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, groups=64, bias=False)), # Depthwise
-            init_(nn.Conv2d(64, 64, kernel_size=1, stride=1, padding=0, bias=False)), # Pointwise
+            # Block 3: stride 2 (DOWNSAMPLE)
+            init_(nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1, groups=64, bias=False)),
+            init_(nn.Conv2d(64, 64, kernel_size=1, stride=1, padding=0, bias=False)),
             nn.LeakyReLU(),
 
-            # Fourth SeparableConv2d: 64 -> 64
-            init_(nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, groups=64, bias=False)), # Depthwise
-            init_(nn.Conv2d(64, 64, kernel_size=1, stride=1, padding=0, bias=False)), # Pointwise
+            # Block 4: stride 2 (DOWNSAMPLE)
+            init_(nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1, groups=64, bias=False)),
+            init_(nn.Conv2d(64, 64, kernel_size=1, stride=1, padding=0, bias=False)),
             nn.LeakyReLU(),
 
-            # Fifth SeparableConv2d: 64 -> 64
-            init_(nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, groups=64, bias=False)), # Depthwise
-            init_(nn.Conv2d(64, 64, kernel_size=1, stride=1, padding=0, bias=False)), # Pointwise
+            # Block 5: stride 1
+            init_(nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, groups=64, bias=False)),
+            init_(nn.Conv2d(64, 64, kernel_size=1, stride=1, padding=0, bias=False)),
             nn.LeakyReLU()
         )
 
-        # 2. Actor head with its own dimensionality reduction
+        # --- DYNAMIC CALCULATION ---
+        # Create a dummy input tensor and pass it through the conv layers to find the output shape
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, num_inputs, self.width, self.length)
+            conv_output = self.shared_conv(dummy_input)
+            # The shape of conv_output is (1, channels, final_length, final_width)
+            final_conv_length = conv_output.shape[2]
+            final_conv_width = conv_output.shape[3]
+        # --- END DYNAMIC CALCULATION ---
+        
+        # 2. Actor head - now uses the dynamically calculated size
+        actor_linear_in_features = 8 * final_conv_length * final_conv_width
         self.actor_head = nn.Sequential(
-            # Use a 1x1 Conv to reduce channels from 64 to 8
             init_(nn.Conv2d(64, 8, 1, stride=1)),
             nn.LeakyReLU(),
             Flatten(),
-            # The input dimension is now small: 8 * width * length
-            init_(nn.Linear(8 * width * length, hidden_size)),
+            init_(nn.Linear(actor_linear_in_features, hidden_size)),
             nn.LeakyReLU()
         )
 
-        # 3. Critic head with its own dimensionality reduction
+        # 3. Critic head - also uses the dynamically calculated size
+        critic_linear_in_features = 4 * final_conv_length * final_conv_width
         self.critic_head = nn.Sequential(
-            # Use a 1x1 Conv to reduce channels from 64 to 4
             init_(nn.Conv2d(64, 4, 1, stride=1)),
             nn.LeakyReLU(),
             Flatten(),
-            # The input dimension is now small: 4 * width * length
-            init_(nn.Linear(4 * width * length, hidden_size))
+            init_(nn.Linear(critic_linear_in_features, hidden_size))
         )
 
-        # Final linear layer for the critic value
         self.critic_linear = init_(nn.Linear(hidden_size, 1))
-        
         self.train()
-
+    
+    # The 'forward' method does not need to be changed
     def forward(self, inputs, rnn_hxs, masks):
-        # Reshape the input
         x = inputs.view(-1, 6, self.width, self.length)
-        
-        # --- New Data Flow ---
-        # 1. Get features from the shared convolutional base
         shared_features = self.shared_conv(x)
-        
-        # 2. Process through the actor head to get features for the policy
         actor_features = self.actor_head(shared_features)
-        
-        # 3. Process through the critic head to get the value
         critic_features = self.critic_head(shared_features)
         value = self.critic_linear(critic_features)
-
-        # Return the same outputs as before
         return value, actor_features, rnn_hxs

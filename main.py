@@ -61,7 +61,7 @@ def train_model(args):
         envs.action_space,
         base_kwargs={"recurrent": False, "hidden_size": args.hidden_size},
     )
-    actor_critic = torch.compile(actor_critic)
+    #actor_critic = torch.compile(actor_critic)
     actor_critic.to(device)
 
     agent = algo.ACKTR(
@@ -109,6 +109,7 @@ def train_model(args):
     while True:
         j += 1
         for step in range(args.num_steps):
+            #start_time_1 = time.perf_counter()
             with torch.no_grad():
                 value, action, action_log_prob, recurrent_hidden_states = (
                     actor_critic.act(
@@ -117,8 +118,14 @@ def train_model(args):
                         rollouts.masks[step],
                     )
                 )
-
+            #end_time_1 = time.perf_counter()
+            #print(f"actor critic act: {end_time_1 - start_time_1} seconds")
+            start_time_2 = time.perf_counter()
             obs, reward, done, infos = envs.step(action)
+            end_time_2 = time.perf_counter()
+            print(f"env step: {end_time_2 - start_time_2} seconds")
+
+
 
             # --- Manually update logs for each parallel environment ---
             for i, info in enumerate(infos):
@@ -153,15 +160,20 @@ def train_model(args):
                 rollouts.masks[-1],
             ).detach()
 
+
+        start_time = time.perf_counter()
         # NOTE: GAE is enabled here by default. Add args.use_gae if you make it configurable.
         rollouts.compute_returns(
             next_value, True, args.gamma, 0.95, use_proper_time_limits=True
         )
+        end_time = time.perf_counter()
+        print(f"Rollout compute returns: {end_time - start_time} seconds") 
 
         value_loss, action_loss, dist_entropy, infeasibility_loss = agent.update(
             rollouts
         )
         rollouts.after_update()
+
 
         if args.save_model and (j % args.save_interval == 0):
             torch.save(
