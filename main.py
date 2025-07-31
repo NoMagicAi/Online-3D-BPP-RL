@@ -120,10 +120,10 @@ def train_model(args):
                 )
             #end_time_1 = time.perf_counter()
             #print(f"actor critic act: {end_time_1 - start_time_1} seconds")
-            start_time_2 = time.perf_counter()
+            #start_time_2 = time.perf_counter()
             obs, reward, done, infos = envs.step(action)
-            end_time_2 = time.perf_counter()
-            print(f"env step: {end_time_2 - start_time_2} seconds")
+            #end_time_2 = time.perf_counter()
+            #print(f"env step: {end_time_2 - start_time_2} seconds")
 
 
 
@@ -161,17 +161,21 @@ def train_model(args):
             ).detach()
 
 
-        start_time = time.perf_counter()
+        #start_time = time.perf_counter()
         # NOTE: GAE is enabled here by default. Add args.use_gae if you make it configurable.
         rollouts.compute_returns(
             next_value, True, args.gamma, 0.95, use_proper_time_limits=True
         )
-        end_time = time.perf_counter()
-        print(f"Rollout compute returns: {end_time - start_time} seconds") 
+        #end_time = time.perf_counter()
+        #print(f"Rollout compute returns: {end_time - start_time} seconds") 
 
+        #print("agent update starts")
+        #start_time_3 = time.perf_counter()
         value_loss, action_loss, dist_entropy, infeasibility_loss = agent.update(
             rollouts
         )
+        #end_time_3 = time.perf_counter()
+        #print(f"Agent update: {end_time_3 - start_time_3} seconds")
         rollouts.after_update()
 
 

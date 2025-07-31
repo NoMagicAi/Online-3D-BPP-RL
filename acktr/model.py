@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import time
 
 # The custom Categorical class is a wrapper that includes the final linear layer
 from acktr.distributions import Categorical
@@ -95,7 +96,10 @@ class Policy(nn.Module):
         return value, action, action_log_probs, rnn_hs
 
     def evaluate_actions(self, inputs, rnn_hs, masks, action, gt_masks):
+        #start_time = time.perf_counter()
         value, actor_features, rnn_hs = self.base(inputs, rnn_hs, masks)
+        #end_time = time.perf_counter()
+        #print(f"Extractor eval: {end_time - start_time} seconds")
         
         action_o, action_x, action_y = action[:, 0], action[:, 1], action[:, 2]
         
@@ -240,9 +244,12 @@ class CNNPro(NNBase):
     
     # The 'forward' method does not need to be changed
     def forward(self, inputs, rnn_hxs, masks):
+        #start_time = time.perf_counter()
         x = inputs.view(-1, 6, self.width, self.length)
         shared_features = self.shared_conv(x)
         actor_features = self.actor_head(shared_features)
         critic_features = self.critic_head(shared_features)
         value = self.critic_linear(critic_features)
+        #end_time = time.perf_counter()
+        #print(f"full forward: {end_time - start_time} seconds")
         return value, actor_features, rnn_hxs

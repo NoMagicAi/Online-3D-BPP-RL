@@ -121,18 +121,43 @@ def compute_cov_g(g: torch.Tensor, classname: str, layer_info: Tuple[List[int], 
 # ==============================================================================
 
 class KFACOptimizer(optim.Optimizer):
+    """
+    K-FAC optimizer with optional low-rank approximation and Fisher update subsampling.
+    """
     def __init__(self, model, lr=0.25, momentum=0.9, stat_decay=0.99, kl_clip=0.001, 
-                 damping=1e-2, weight_decay=0, fast_cnn=False, Ts=1, Tf=10, kfac_approx_rank=64):
+                 damping=1e-2, weight_decay=0, fast_cnn=False, Ts=1, Tf=10, 
+                 kfac_approx_rank=64, fisher_frac=1.0):
+        """
+        Args:
+            model (torch.nn.Module): The model to optimize.
+            lr (float): Learning rate.
+            momentum (float): Momentum for the SGD update.
+            stat_decay (float): Decay factor for running averages of covariance matrices.
+            kl_clip (float): Clipping parameter for the KL divergence.
+            damping (float): Damping factor for the Fisher matrix inverse.
+            weight_decay (float): L2 penalty.
+            fast_cnn (bool): Use a faster but less accurate method for Conv2D layers.
+            Ts (int): Frequency (in steps) to update Fisher statistics.
+            Tf (int): Frequency (in steps) to update the eigendecomposition.
+            kfac_approx_rank (int): Rank for the low-rank SVD approximation. If None, use full SVD.
+            fisher_frac (float): Fraction of the batch to use for Fisher statistics. 1.0 uses the full batch.
+        """
         
         def split_bias(module):
+            """
+            Recursively splits bias parameters from linear and conv layers.
+            This is a standard K-FAC technique to handle biases separately.
+            """
             for mname, child in module.named_children():
                 if hasattr(child, 'bias') and child.bias is not None:
                     module._modules[mname] = SplitBias(child)
                 else:
                     split_bias(child)
         
+        # Prepare the model by splitting bias terms
         split_bias(model)
         
+        # Initialize the optimizer
         super(KFACOptimizer, self).__init__(model.parameters(), dict())
 
         self.known_modules = {'Linear', 'Conv2d', 'AddBias'}
@@ -141,10 +166,13 @@ class KFACOptimizer(optim.Optimizer):
         self._prepare_model()
         
         self.steps = 0
+        
+        # Dictionaries to store K-FAC statistics
         self.m_aa, self.m_gg = {}, {}
         self.Q_a, self.Q_g = {}, {}
         self.d_a, self.d_g = {}, {}
         
+        # Hyperparameters
         self.stat_decay = stat_decay
         self.momentum = momentum
         self.lr = lr
@@ -155,15 +183,28 @@ class KFACOptimizer(optim.Optimizer):
         self.Ts = Ts
         self.Tf = Tf
         self.kfac_approx_rank = kfac_approx_rank
+        self.fisher_frac = fisher_frac # New parameter for subsampling
         
         self.acc_stats = True
         # Use a standard SGD optimizer for the final parameter update
         self.optim = optim.SGD(model.parameters(), lr=self.lr * (1 - self.momentum), momentum=self.momentum)
 
     def _save_input(self, module, input):
+        """Hook to save module inputs for covariance calculation."""
         if torch.is_grad_enabled() and self.steps % self.Ts == 0:
-            # FIXED: Clone the tensor to prevent view-related errors with hooks.
             a = input[0].detach().clone()
+
+            # === NEW: Subsampling Logic ===
+            # If fisher_frac is less than 1, use a random subset of the batch
+            # to compute the activation covariance matrix (m_aa).
+            if self.fisher_frac < 1.0:
+                batch_size = a.size(0)
+                sample_size = int(batch_size * self.fisher_frac)
+                if sample_size < 1: sample_size = 1 # Ensure at least one sample
+                indices = torch.randperm(batch_size, device=a.device)[:sample_size]
+                a = a.index_select(0, indices)
+            # ============================
+
             classname = module.__class__.__name__
             is_add_bias = classname == 'AddBias'
             
@@ -180,9 +221,21 @@ class KFACOptimizer(optim.Optimizer):
             self.m_aa[module].mul_(self.stat_decay).add_(aa, alpha=1 - self.stat_decay)
 
     def _save_grad_output(self, module, grad_input, grad_output):
+        """Hook to save module gradient outputs for covariance calculation."""
         if self.acc_stats:
-            # FIXED: Clone the tensor to prevent view-related errors with hooks.
             g = grad_output[0].detach().clone()
+
+            # === NEW: Subsampling Logic ===
+            # If fisher_frac is less than 1, use a random subset of the batch
+            # to compute the gradient covariance matrix (m_gg).
+            if self.fisher_frac < 1.0:
+                batch_size = g.size(0)
+                sample_size = int(batch_size * self.fisher_frac)
+                if sample_size < 1: sample_size = 1 # Ensure at least one sample
+                indices = torch.randperm(batch_size, device=g.device)[:sample_size]
+                g = g.index_select(0, indices)
+            # ============================
+
             classname = module.__class__.__name__
             is_add_bias = classname == 'AddBias'
             
@@ -199,6 +252,7 @@ class KFACOptimizer(optim.Optimizer):
             self.m_gg[module].mul_(self.stat_decay).add_(gg, alpha=1 - self.stat_decay)
 
     def _prepare_model(self):
+        """Register hooks for all known module types."""
         for module in self.model.modules():
             classname = module.__class__.__name__
             if classname in self.known_modules:
@@ -208,6 +262,8 @@ class KFACOptimizer(optim.Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
+        """Performs a single optimization step."""
+        # Apply weight decay to raw gradients
         if self.weight_decay > 0:
             for group in self.param_groups:
                 for p in group['params']:
@@ -245,7 +301,7 @@ class KFACOptimizer(optim.Optimizer):
             grad = p.grad.detach()
             is_grouped = self.Q_g[m].dim() == 3
             
-            if is_grouped:
+            if is_grouped: # Grouped convolutions
                 groups = m.groups
                 p_grad_mat = grad.view(groups, self.Q_g[m].size(1), -1)
                 # v = Q_g @ ( (Q_g.T @ G @ Q_a) / (d_g * d_a.T + la) ) @ Q_a.T
@@ -253,7 +309,7 @@ class KFACOptimizer(optim.Optimizer):
                 denominator = self.d_g[m].unsqueeze(2) * self.d_a[m].unsqueeze(1) + la
                 v2 = v1 / denominator
                 v = torch.bmm(self.Q_g[m], torch.bmm(v2, self.Q_a[m].transpose(1, 2)))
-            else:
+            else: # Linear or standard Conv2D
                 classname = m.__class__.__name__
                 p_grad_mat = grad.view(grad.size(0), -1) if 'Conv' in classname else grad
                 # Using torch.linalg.multi_dot can be faster by optimizing multiplication order
@@ -272,12 +328,15 @@ class KFACOptimizer(optim.Optimizer):
         # Update gradients with the preconditioned and clipped values
         for p in self.model.parameters():
             if p.grad is not None and p in preconditioned_grads:
-                # FIXED: Assign a new tensor instead of performing an in-place copy
-                # to avoid autograd conflicts with hooks.
+                # This is the key step: replace the original gradient with the
+                # preconditioned, scaled, and clipped version.
                 p.grad = preconditioned_grads[p] * nu
 
+        # Perform the final parameter update using the underlying SGD optimizer
         self.optim.step()
         self.steps += 1
+
+
 
 # ==============================================================================
 # ACKTR Algorithm (Optimized with AMP Support)
@@ -337,6 +396,7 @@ class ACKTR():
             obs_tensor = rollouts.obs[:-1].view(-1, 6, self.args.container_size[0], self.args.container_size[1])
             gt_masks = obs_tensor[:, 4:6, :, :]
 
+            #start_time_2 = time.perf_counter()
             values, action_log_probs, dist_entropy, _, infeasibility_loss = self.actor_critic.evaluate_actions(
                 rollouts.obs[:-1].view(-1, *obs_shape),
                 rollouts.recurrent_hidden_states[0].view(-1, self.actor_critic.recurrent_hidden_state_size),
@@ -344,6 +404,8 @@ class ACKTR():
                 rollouts.actions.view(-1, action_shape),
                 gt_masks
             )
+            #end_time_2 = time.perf_counter()
+            #print(f"actor critic eval: {end_time_2 - start_time_2} seconds")
 
             values = values.view(num_steps, num_processes, 1)
             action_log_probs = action_log_probs.view(num_steps, num_processes, 1)
@@ -375,7 +437,7 @@ class ACKTR():
                 fisher_loss.backward(retain_graph=True)
                 #end_time = time.perf_counter()
                 #elapsed_time = end_time - start_time
-                #print(f"Time taken for backward pass: {elapsed_time} seconds")
+                #print(f"fisher loss: {elapsed_time} seconds")
             self.optimizer.acc_stats = False
 
         self.optimizer.zero_grad()
@@ -390,10 +452,16 @@ class ACKTR():
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
+            #start_time_3 = time.perf_counter()
             loss.backward()
+            #end_time_3 = time.perf_counter()
+            #print(f"loss backward: {end_time_3 - start_time_3} seconds")
             if not self.acktr:
                 nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+            #start_time_4 = time.perf_counter()
             self.optimizer.step()
+            #end_time_4 = time.perf_counter()
+            #print(f"optimizer step: {end_time_4 - start_time_4} seconds")
 
         return value_loss.item(), action_loss.item(), dist_entropy.item(), infeasibility_loss.item()
 
