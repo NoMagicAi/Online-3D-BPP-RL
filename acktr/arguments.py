@@ -21,7 +21,7 @@ def get_args():
     parser.add_argument('--item-seq', default='cut1')
     parser.add_argument('--algorithm', default='acktr', type=str)
     parser.add_argument('--gamma', default=1.0, type=float)
-    parser.add_argument('--use-gae', action='store_true', default=True)
+    parser.add_argument('--use-gae', action='store_true', default=False)
     parser.add_argument('--gae-lambda', type=float, default=0.95)
     parser.add_argument('--entropy_coef', default=0.01, type=float)
     parser.add_argument('--value_loss_coef', default=0.5, type=float)
@@ -40,6 +40,10 @@ def get_args():
     parser.add_argument('--load_dir', default='./pretrained_models/')
     parser.add_argument('--save_dir', default='./saved_models/')
     parser.add_argument('--seed', default=1, type=int)
+    parser.add_argument('--use-popart', action='store_true', default=False,
+                        help='use PopArt to normalize rewards')
+    parser.add_argument('--popart-beta', type=float, default=1e-4,
+                        help='beta for running mean and std in PopArt (decay factor)')
     
     args = parser.parse_args()
 

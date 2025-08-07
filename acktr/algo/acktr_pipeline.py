@@ -15,6 +15,8 @@ class AddBias(nn.Module):
     """
     A module that adds a learnable bias to the input. This is used to separate
     the bias from the main weight matrix of a layer, which is a requirement for KFAC.
+    
+    --- MODIFIED TO SUPPORT 3D TENSORS ---
     """
     def __init__(self, bias: torch.Tensor):
         super(AddBias, self).__init__()
@@ -22,11 +24,18 @@ class AddBias(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 2:
-            # For Linear layers
+            # Handles (Batch, Features) for standard nn.Linear
             bias = self._bias.t().view(1, -1)
+        # --- START FIX ---
+        # Added a specific case for 3D tensors from the attention mechanism
+        elif x.dim() == 3:
+            # Handles (Batch, SequenceLength, Features)
+            bias = self._bias.t().view(1, 1, -1)
+        # --- END FIX ---
         else:
-            # For Conv2d layers
+            # Handles (Batch, Channels, H, W) for nn.Conv2d
             bias = self._bias.t().view(1, -1, 1, 1)
+            
         return x + bias
 
 class SplitBias(nn.Module):
@@ -61,6 +70,8 @@ def _extract_patches(x: torch.Tensor, kernel_size: List[int], stride: List[int],
 def compute_cov_a(a: torch.Tensor, classname: str, layer_info: Tuple[List[int], List[int], List[int], int], is_add_bias: bool) -> torch.Tensor:
     """
     JIT-compiled function to compute the covariance matrix of activations 'a'.
+
+    --- MODIFIED TO SUPPORT 3D TENSORS FOR LINEAR LAYERS ---
     """
     batch_size = a.size(0)
 
@@ -79,7 +90,17 @@ def compute_cov_a(a: torch.Tensor, classname: str, layer_info: Tuple[List[int], 
         else:
             cov_a = a.t() @ a / batch_size
     else: # Linear
-        cov_a = a.t() @ a / batch_size
+        # --- START FIX ---
+        if a.dim() == 3:
+            # This handles the (Batch, SeqLen, Features) tensor from attention
+            # We reshape it to (Batch * SeqLen, Features) to compute covariance
+            effective_batch_size = a.size(0) * a.size(1)
+            a = a.reshape(effective_batch_size, a.size(-1))
+            cov_a = a.t() @ a / effective_batch_size
+        else:
+            # This handles the standard 2D (Batch, Features) tensor
+            cov_a = a.t() @ a / batch_size
+        # --- END FIX ---
     
     return cov_a
 
@@ -87,6 +108,8 @@ def compute_cov_a(a: torch.Tensor, classname: str, layer_info: Tuple[List[int], 
 def compute_cov_g(g: torch.Tensor, classname: str, layer_info: Tuple[List[int], List[int], List[int], int], fast_cnn: bool, is_add_bias: bool) -> torch.Tensor:
     """
     JIT-compiled function to compute the covariance matrix of pre-activation gradients 'g'.
+
+    --- MODIFIED TO SUPPORT 3D TENSORS FOR LINEAR LAYERS ---
     """
     batch_size = g.size(0)
     
@@ -111,9 +134,18 @@ def compute_cov_g(g: torch.Tensor, classname: str, layer_info: Tuple[List[int], 
             g_ = g * batch_size
             cov_g = g_.t() @ g_ / g.size(0)
     else: # Linear
-        g_ = g * batch_size
-        cov_g = g_.t() @ g_ / g.size(0)
+        # --- START FIX ---
+        if g.dim() == 3:
+            # This handles the (Batch, SeqLen, Features) tensor from attention's backward pass
+            # We reshape it to (Batch * SeqLen, Features)
+            g = g.reshape(-1, g.size(-1))
         
+        # The rest of the logic now works for both 2D and reshaped 3D tensors
+        g_ = g * batch_size
+        # Note: We use the original batch_size for normalization as per the KFAC implementation style
+        cov_g = g_.t() @ g_ / batch_size
+        # --- END FIX ---
+            
     return cov_g
 
 # ==============================================================================
@@ -124,9 +156,9 @@ class KFACOptimizer(optim.Optimizer):
     """
     K-FAC optimizer with optional low-rank approximation and Fisher update subsampling.
     """
-    def __init__(self, model, lr=0.25, momentum=0.9, stat_decay=0.99, kl_clip=0.001, 
+    def __init__(self, model, lr=0.1, momentum=0.9, stat_decay=0.99, kl_clip=0.001, 
                  damping=1e-2, weight_decay=0, fast_cnn=False, Ts=1, Tf=10, 
-                 kfac_approx_rank=64, fisher_frac=1.0):
+                 kfac_approx_rank=None, fisher_frac=1.0):
         """
         Args:
             model (torch.nn.Module): The model to optimize.
@@ -284,9 +316,9 @@ class KFACOptimizer(optim.Optimizer):
             if self.steps % self.Tf == 0:
                 if self.kfac_approx_rank is not None:
                     # Fast, approximate SVD for efficiency
-                    U_g, S_g, _ = torch.svd_lowrank(self.m_gg[m], q=self.kfac_approx_rank)
+                    U_g, S_g, _ = torch.svd_lowrank(self.m_gg[m], q=self.kfac_approx_rank, niter=10)
                     self.d_g[m], self.Q_g[m] = S_g, U_g
-                    U_a, S_a, _ = torch.svd_lowrank(self.m_aa[m], q=self.kfac_approx_rank)
+                    U_a, S_a, _ = torch.svd_lowrank(self.m_aa[m], q=self.kfac_approx_rank, niter=10)
                     self.d_a[m], self.Q_a[m] = S_a, U_a
                 else:
                     # Exact, slower eigendecomposition
@@ -350,7 +382,7 @@ class ACKTR():
                  invaild_coef,
                  acktr=False,
                  # KFAC-specific hyperparameters
-                 lr=0.25, 
+                 lr=0.01, 
                  kfac_clip=0.001,
                  kfac_damping=1e-2,
                  kfac_stat_decay=0.99,
@@ -370,6 +402,13 @@ class ACKTR():
         self.entropy_coef = entropy_coef
         self.args = args
         self.use_amp = use_amp and torch.cuda.is_available()
+        self.use_popart = args.use_popart
+        if self.use_popart:
+            # Register buffers to the actor_critic model. This ensures they are part of the
+            # model's state_dict and get moved to the correct device automatically.
+            self.actor_critic.register_buffer('popart_mean', torch.zeros(1, device=args.device))
+            self.actor_critic.register_buffer('popart_mean_sq', torch.ones(1, device=args.device))
+            self.popart_beta = args.popart_beta
 
         if acktr:
             self.optimizer = KFACOptimizer(
@@ -386,10 +425,84 @@ class ACKTR():
         if self.use_amp:
             self.scaler = torch.cuda.amp.GradScaler()
 
+    @torch.no_grad()
+    def de_normalize_value(self, value: torch.Tensor) -> torch.Tensor:
+        """
+        De-normalizes the value output from the network using the current POP-ART statistics.
+        V_real = V_norm * σ + μ
+        """
+        if not self.use_popart:
+            return value
+        
+        mean = self.actor_critic.popart_mean
+        mean_sq = self.actor_critic.popart_mean_sq
+        # Add a small epsilon for numerical stability
+        std = torch.sqrt(mean_sq - mean.pow(2)).clamp(min=1e-6)
+        
+        return value * std + mean
+
     def update(self, rollouts):
         obs_shape = rollouts.obs.size()[2:]
         action_shape = rollouts.actions.size()[-1]
         num_steps, num_processes, _ = rollouts.rewards.size()
+
+        ## --- START OF POP-ART BLOCK ---
+        if self.use_popart:
+            with torch.no_grad():
+                # The returns in the buffer are currently unnormalized.
+                returns = rollouts.returns
+                
+                # Get old statistics for the linear layer update
+                old_mean = self.actor_critic.popart_mean.clone()
+                old_std = torch.sqrt(self.actor_critic.popart_mean_sq - old_mean.pow(2)).clamp(min=1e-6)
+
+                sample_obs = rollouts.obs[0] # Pick a consistent sample
+                val_before_update = self.de_normalize_value(self.actor_critic.get_value(sample_obs, rollouts.recurrent_hidden_states[0], rollouts.masks[0]))
+
+
+                # Update running statistics using the new batch of returns
+                batch_mean = returns.mean()
+                batch_mean_sq = returns.pow(2).mean()
+
+                self.actor_critic.popart_mean.mul_(1 - self.popart_beta).add_(batch_mean, alpha=self.popart_beta)
+                self.actor_critic.popart_mean_sq.mul_(1 - self.popart_beta).add_(batch_mean_sq, alpha=self.popart_beta)
+
+                # Get new statistics
+                new_mean = self.actor_critic.popart_mean
+                new_std = torch.sqrt(self.actor_critic.popart_mean_sq - new_mean.pow(2)).clamp(min=1e-6)
+
+                #
+                # ⚠️ IMPORTANT: Identify the final linear layer of your value function head.
+                # Common names are `critic_linear`, `value_head`, etc.
+                # If your actor and critic share the final layer (like in the DummyActorCritic),
+                # POP-ART is not directly applicable and will harm policy learning.
+                # Assuming a separate value head like `self.actor_critic.base.critic_linear`
+                #
+                # ⚠️ IMPORTANT: This line should still point to the final value head layer.
+                # Now we know it's a 'SplitBias' wrapper.
+                value_head_wrapper = self.actor_critic.base.critic_linear # <--- CONFIRM THIS IS YOUR LAYER
+
+                ## --- CORRECTED POP-ART MODIFICATION for K-FAC ---
+                # Access the weights from the original module inside the wrapper.
+                W = value_head_wrapper.module.weight
+                
+                # Access the bias from the 'add_bias' part of the wrapper.
+                # The parameter itself is typically stored in an attribute named `_bias`.
+                b = value_head_wrapper.add_bias._bias
+
+                # Update the layer's weights and bias data in-place
+                W.data = W.data * old_std / new_std
+                b.data = (b.data * old_std + old_mean - new_mean) / new_std
+                ## ------------------------------------------------
+            
+                val_after_update = self.de_normalize_value(self.actor_critic.get_value(sample_obs,  rollouts.recurrent_hidden_states[0], rollouts.masks[0]))
+
+                # Check if the output is preserved. Allow for minor floating point differences.
+                assert torch.allclose(val_before_update, val_after_update, atol=1e-5), "POP-ART output is not preserved!"
+
+            # Normalize the returns in the rollout buffer for the upcoming loss calculation
+            rollouts.returns = (rollouts.returns - new_mean) / new_std
+        ## --- END OF POP-ART BLOCK ---
 
         # FIXED: Updated to modern torch.amp.autocast syntax
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
@@ -410,10 +523,22 @@ class ACKTR():
             values = values.view(num_steps, num_processes, 1)
             action_log_probs = action_log_probs.view(num_steps, num_processes, 1)
 
+            # 1. Calculate the raw advantages
             advantages = rollouts.returns[:-1] - values
-            value_loss = advantages.pow(2).mean()
-            action_loss = -(advantages.detach() * action_log_probs).mean()
             
+            # 2. Use the raw advantages for the value loss
+            value_loss = advantages.pow(2).mean()
+
+            # 3. Normalize the advantages for the action loss
+            #    This is the new block of code to add. 👍
+            with torch.no_grad():
+                adv_mean = advantages.mean()
+                adv_std = advantages.std()
+                normalized_advantages = (advantages - adv_mean) / (adv_std + 1e-5)
+
+            # 4. Use the normalized advantages (detached) for the action loss
+            action_loss = -(normalized_advantages.detach() * action_log_probs).mean()
+
             loss = (value_loss * self.value_loss_coef 
                     + action_loss 
                     - dist_entropy * self.entropy_coef
@@ -509,7 +634,7 @@ if __name__ == '__main__':
         entropy_coef=0.01,
         invaild_coef=1.0,
         acktr=True,
-        lr=0.1,             # KFAC learning rate
+        lr=0.01,             # KFAC learning rate
         kfac_clip=0.01,     # KFAC kl_clip
         kfac_damping=0.001, # KFAC damping
         use_amp=False,      # Set to True if using a CUDA GPU

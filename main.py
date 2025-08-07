@@ -13,6 +13,7 @@ from acktr.arguments import get_args
 from acktr.model import Policy
 from acktr.storage import RolloutStorage
 from tensorboardX import SummaryWriter
+from gym.envs.registration import register
 
 
 def main(args):
@@ -160,6 +161,10 @@ def train_model(args):
                 rollouts.masks[-1],
             ).detach()
 
+            ## --- POP-ART MODIFICATION ---
+            # De-normalize the value before using it for bootstrapping.
+            next_value = agent.de_normalize_value(next_value)
+            ## --------------------------
 
         #start_time = time.perf_counter()
         # NOTE: GAE is enabled here by default. Add args.use_gae if you make it configurable.
@@ -187,6 +192,8 @@ def train_model(args):
         if j % args.log_interval == 0 and len(episode_rewards_summary) > 1:
             total_num_steps = j * args.num_processes * args.num_steps
             end = time.time()
+            popart_mean = agent.actor_critic.popart_mean.item()
+            popart_std = torch.sqrt(agent.actor_critic.popart_mean_sq - agent.actor_critic.popart_mean.pow(2)).item()
 
             print(
                 f"Updates {j}, num timesteps {total_num_steps}, FPS {int(total_num_steps / (end - start))}\n"
@@ -196,6 +203,8 @@ def train_model(args):
                 f"  Mean items packed: {np.mean(episode_items_summary):.2f}\n"
                 f"Losses:\n"
                 f"  entropy: {dist_entropy:.4f}, value: {value_loss:.4f}, action: {action_loss:.4f}, infeasibility: {infeasibility_loss:.4f}\n"
+                f"popart/mean: {popart_mean:.3f}\n"
+                f"popart/std: {popart_std:.3f}\n"
             )
 
             if writer:
@@ -212,8 +221,23 @@ def train_model(args):
                 writer.add_scalar("losses/value_loss", value_loss, j)
                 writer.add_scalar("losses/action_loss", action_loss, j)
                 writer.add_scalar("losses/infeasibility_loss", infeasibility_loss, j)
+                '''
+                if args.use_popart:
+                    popart_mean = agent.actor_critic.popart_mean.item()
+                    popart_std = torch.sqrt(agent.actor_critic.popart_mean_sq - agent.actor_critic.popart_mean.pow(2)).item()
+                    print(f"  POP-ART stats: mean={popart_mean:.3f}, std={popart_std:.3f}")
+                    if writer:
+                        writer.add_scalar("popart/mean", popart_mean, j)
+                        writer.add_scalar("popart/std", popart_std, j)
+                '''
 
+def registration_envs():
+    register(
+        id='Bpp-v0',                                  # Format should be xxx-v0, xxx-v1
+        entry_point='envs.bpp0:PackingGame',   # Expalined in envs/__init__.py
+    )
 
 if __name__ == "__main__":
+    registration_envs()
     args = get_args()
     main(args)
