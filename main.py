@@ -14,6 +14,7 @@ from acktr.model import Policy
 from acktr.storage import RolloutStorage
 from tensorboardX import SummaryWriter
 from gym.envs.registration import register
+from clearml import Task # <-- ADDED: Import ClearML
 
 
 def main(args):
@@ -29,6 +30,17 @@ def main(args):
 
 def train_model(args):
     custom = input("please input the test name: ")
+
+    # --- ADDED: ClearML Initialize Task ---
+    task = Task.init(
+        project_name=f'ACKTR/{args.env_name}',
+        task_name=custom,
+        output_uri=True
+    )
+    # Connect your arguments for hyperparameter tracking
+    task.connect(args)
+    # ---
+
     time_now = time.strftime("%Y.%m.%d-%H-%M", time.localtime(time.time()))
     env_name = args.env_name
 
@@ -105,6 +117,9 @@ def train_model(args):
         if not os.path.exists(tbx_dir):
             os.makedirs(tbx_dir)
         writer = SummaryWriter(logdir=tbx_dir)
+    
+    # --- ADDED: Initialize a tracker for the best performance ---
+    best_mean_ratio = 0.0
 
     j = 0
     while True:
@@ -179,33 +194,53 @@ def train_model(args):
         )
         rollouts.after_update()
 
-
-        if args.save_model and (j % args.save_interval == 0):
-            torch.save(
-                [
-                    actor_critic.state_dict(),
-                    getattr(utils.get_vec_normalize(envs), "ob_rms", None),
-                ],
-                os.path.join(data_path, env_name + time_now + ".pt"),
-            )
+        # --- REMOVED: The old periodic saving block is gone ---
+        # if args.save_model and (j % args.save_interval == 0):
+        #    ...
 
         if j % args.log_interval == 0 and len(episode_rewards_summary) > 1:
             total_num_steps = j * args.num_processes * args.num_steps
             end = time.time()
             popart_mean = agent.actor_critic.popart_mean.item()
             popart_std = torch.sqrt(agent.actor_critic.popart_mean_sq - agent.actor_critic.popart_mean.pow(2)).item()
+            
+            # --- ADDED: Calculate current performance ---
+            current_mean_ratio = np.mean(episode_ratio_summary)
 
             print(
                 f"Updates {j}, num timesteps {total_num_steps}, FPS {int(total_num_steps / (end - start))}\n"
                 f"Last {len(episode_rewards_summary)} training episodes:\n"
                 f"  Mean/median reward: {np.mean(episode_rewards_summary):.2f}/{np.median(episode_rewards_summary):.2f}\n"
-                f"  Mean space ratio: {np.mean(episode_ratio_summary):.3f}\n"
+                f"  Mean space ratio: {current_mean_ratio:.3f}\n"
                 f"  Mean items packed: {np.mean(episode_items_summary):.2f}\n"
                 f"Losses:\n"
                 f"  entropy: {dist_entropy:.4f}, value: {value_loss:.4f}, action: {action_loss:.4f}, infeasibility: {infeasibility_loss:.4f}\n"
                 f"popart/mean: {popart_mean:.3f}\n"
                 f"popart/std: {popart_std:.3f}\n"
             )
+
+            # --- ADDED: Check for new best performance and save the model ---
+            if args.save_model and (current_mean_ratio > best_mean_ratio):
+                print(f"🚀 New best model found! Ratio improved from {best_mean_ratio:.4f} to {current_mean_ratio:.4f}. Saving model...")
+                best_mean_ratio = current_mean_ratio
+                
+                # Define the save path with a consistent filename
+                save_file_path = os.path.join(data_path, "best_model.pt")
+
+                torch.save(
+                    [
+                        actor_critic.state_dict(),
+                        getattr(utils.get_vec_normalize(envs), "ob_rms", None),
+                    ],
+                    save_file_path,
+                )
+                
+                # --- ClearML: Upload the new best model ---
+                task.upload_artifact(
+                    name='best_model', 
+                    artifact_object=save_file_path,
+                )
+
 
             if writer:
                 writer.add_scalar(
@@ -221,20 +256,14 @@ def train_model(args):
                 writer.add_scalar("losses/value_loss", value_loss, j)
                 writer.add_scalar("losses/action_loss", action_loss, j)
                 writer.add_scalar("losses/infeasibility_loss", infeasibility_loss, j)
-                '''
-                if args.use_popart:
-                    popart_mean = agent.actor_critic.popart_mean.item()
-                    popart_std = torch.sqrt(agent.actor_critic.popart_mean_sq - agent.actor_critic.popart_mean.pow(2)).item()
-                    print(f"  POP-ART stats: mean={popart_mean:.3f}, std={popart_std:.3f}")
-                    if writer:
-                        writer.add_scalar("popart/mean", popart_mean, j)
-                        writer.add_scalar("popart/std", popart_std, j)
-                '''
+                writer.add_scalar("popart/mean", popart_mean, j)
+                writer.add_scalar("popart/std", popart_std, j)
+
 
 def registration_envs():
     register(
         id='Bpp-v0',                                  # Format should be xxx-v0, xxx-v1
-        entry_point='envs.bpp0:PackingGame',   # Expalined in envs/__init__.py
+        entry_point='envs.bpp0:PackingGame',    # Expalined in envs/__init__.py
     )
 
 if __name__ == "__main__":

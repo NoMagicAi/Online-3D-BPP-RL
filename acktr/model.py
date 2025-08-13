@@ -350,17 +350,26 @@ class EESPNetFeatureExtractor(NNBase):
             nn.LeakyReLU(inplace=False)
         )
 
-        critic_linear_in_features = 64 * POOL_OUTPUT_SIZE * POOL_OUTPUT_SIZE
+        # **MODIFIED CRITIC HEAD**
+        # The critic head is now a spatial value estimator. It uses two
+        # convolutional layers to produce a value map corresponding to each
+        # possible action (orientation, x, y).
+        num_orientations = 2  # As defined by the action space (o, x, y)
         self.critic_head = nn.Sequential(
-            init_(SeparableConv2d(32, 64, kernel_size=1)), # Takes 32 channels from upsampler
+            # First 2D convolution layer
+            init_(SeparableConv2d(32, 64, kernel_size=3, padding=1, bias=False)),
             nn.LeakyReLU(inplace=False),
-            nn.AdaptiveAvgPool2d((POOL_OUTPUT_SIZE, POOL_OUTPUT_SIZE)),
-            Flatten(),
-            init_(nn.Linear(critic_linear_in_features, hidden_size)),
-            nn.LayerNorm(hidden_size)
+            # Second 2D convolution layer outputs a map per orientation
+            # MODIFICATION: Set bias=True for PopArt compatibility
+            init_(SeparableConv2d(64, num_orientations, kernel_size=3, padding=1, bias=True))
         )
 
-        self.critic_linear = init_(nn.Linear(hidden_size, 1))
+        # Temperature for the softmax, allowing smooth interpolation between mean and max.
+        self.softmax_temp = 1.0
+
+        # The critic_linear layer is removed as the value is computed directly
+        # from the spatial value map in the forward pass.
+
         self.train()
 
     def forward(self, inputs, rnn_hxs, masks):
@@ -373,14 +382,53 @@ class EESPNetFeatureExtractor(NNBase):
         # The output `shared_features` is now full-resolution
         shared_features = self.upsample_head(downsampled_features)
 
-        # Heads now operate on the full-resolution map
+        # --- Heads operate on the full-resolution map ---
         orientation_features = self.orientation_head(shared_features)
-        critic_features = self.critic_head(shared_features)
-        value = self.critic_linear(critic_features)
 
-        # We now pass the full-resolution map out of the base model
+        # **NEW CRITIC LOGIC**
+
+        # **FIX:** Ensure spatial dimensions of features match the input/mask dimensions.
+        # This handles cases where the encoder-decoder architecture doesn't
+        # perfectly restore the original size, which caused the IndexError.
+        if shared_features.shape[-2:] != (self.width, self.length):
+            shared_features_for_critic = F.interpolate(
+                shared_features,
+                size=(self.width, self.length),
+                mode='bilinear',
+                align_corners=False
+            )
+        else:
+            shared_features_for_critic = shared_features
+
+        # 1. Estimate a value map using the correctly-sized features.
+        #    value_map shape: (batch, num_orientations, self.width, self.length)
+        value_map = self.critic_head(shared_features_for_critic)
+
+
+
+        # 2. Extract action masks from the input observation.
+        #    mask_o0, mask_o1 shape: (batch, self.width, self.length)
+        mask_o0, mask_o1 = x[:, 4, :, :], x[:, 5, :, :]
+        #    action_mask shape: (batch, num_orientations, self.width, self.length)
+        action_mask = torch.stack([mask_o0, mask_o1], dim=1).bool()
+
+        # 3. Flatten map and mask for softmax. The shapes will now match.
+        batch_size = value_map.size(0)
+        flattened_values = value_map.view(batch_size, -1)
+        flattened_mask = action_mask.view(batch_size, -1)
+
+        # 4. Apply mask by setting values of invalid positions to -inf.
+        masked_values = flattened_values.clone()
+        masked_values[~flattened_mask] = -float('inf')
+
+        # 5. Compute softmax weights over all valid positions.
+        weights = F.softmax(masked_values / self.softmax_temp, dim=1)
+
+        # 6. Calculate the final value as the weighted average.
+        value = torch.sum(weights * flattened_values, dim=1).unsqueeze(-1)
+
+        # The output signature remains the same to preserve the API.
         return value, orientation_features, shared_features, rnn_hxs
-
 
 #==============================================================================
 # --- End of Lightweight Architecture ---
