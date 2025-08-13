@@ -53,25 +53,29 @@ class SplitBias(nn.Module):
         x = self.module(input)
         return self.add_bias(x)
 
+# --- START FIX: MODIFIED TO SUPPORT DILATED CONVOLUTIONS ---
 @torch.jit.script
-def _extract_patches(x: torch.Tensor, kernel_size: List[int], stride: List[int], padding: List[int]) -> torch.Tensor:
+def _extract_patches(x: torch.Tensor, kernel_size: List[int], stride: List[int], padding: List[int], dilation: List[int]) -> torch.Tensor:
     """
     JIT-compiled function to extract patches from a feature map, equivalent to the 'im2col' operation.
     This is a critical step for computing the covariance of activations in convolutional layers.
+    --- MODIFIED TO SUPPORT DILATION ---
     """
-    if padding[0] > 0 or padding[1] > 0:
-        x = F.pad(x, (padding[1], padding[1], padding[0], padding[0]))
-    x = x.unfold(2, kernel_size[0], stride[0])
-    x = x.unfold(3, kernel_size[1], stride[1])
-    x = x.transpose_(1, 2).transpose_(2, 3).contiguous()
-    return x.view(x.size(0), x.size(1), x.size(2), -1)
+    # F.unfold handles padding, stride, and dilation automatically.
+    x = F.unfold(x, kernel_size, dilation=dilation, padding=padding, stride=stride)
+    # The output of F.unfold is (Batch, C_in * K_h * K_w, Num_Patches).
+    # We transpose it to (Batch, Num_Patches, C_in * K_h * K_w) to be consistent
+    # with the expectation of the covariance calculation (averaging over patches).
+    return x.transpose(1, 2)
+# --- END FIX ---
 
 @torch.jit.script
-def compute_cov_a(a: torch.Tensor, classname: str, layer_info: Tuple[List[int], List[int], List[int], int], is_add_bias: bool) -> torch.Tensor:
+def compute_cov_a(a: torch.Tensor, classname: str, layer_info: Tuple[List[int], List[int], List[int], List[int], int], is_add_bias: bool) -> torch.Tensor:
     """
     JIT-compiled function to compute the covariance matrix of activations 'a'.
 
     --- MODIFIED TO SUPPORT 3D TENSORS FOR LINEAR LAYERS ---
+    --- MODIFIED TO SUPPORT DILATED CONVOLUTIONS ---
     """
     batch_size = a.size(0)
 
@@ -80,9 +84,12 @@ def compute_cov_a(a: torch.Tensor, classname: str, layer_info: Tuple[List[int], 
         a = torch.ones(batch_size, 1, device=a.device)
         cov_a = a.t() @ (a / batch_size)
     elif classname == 'Conv2d':
-        kernel_size, stride, padding, groups = layer_info
-        a = _extract_patches(a, kernel_size, stride, padding)
-        a = a.view(batch_size, -1, a.size(-1)).mean(1) # Average over spatial locations
+        # --- START FIX: MODIFIED TO SUPPORT DILATED CONVOLUTIONS ---
+        kernel_size, stride, padding, dilation, groups = layer_info
+        a = _extract_patches(a, kernel_size, stride, padding, dilation)
+        # a is now (Batch, Num_Patches, C_in * K_h * K_w), so we average over the patch dimension (1).
+        a = a.mean(1) # Average over spatial locations
+        # --- END FIX ---
         if groups > 1:
             # Handle grouped convolutions
             a = a.view(batch_size, groups, -1).transpose(0, 1)
@@ -90,7 +97,6 @@ def compute_cov_a(a: torch.Tensor, classname: str, layer_info: Tuple[List[int], 
         else:
             cov_a = a.t() @ a / batch_size
     else: # Linear
-        # --- START FIX ---
         if a.dim() == 3:
             # This handles the (Batch, SeqLen, Features) tensor from attention
             # We reshape it to (Batch * SeqLen, Features) to compute covariance
@@ -100,16 +106,16 @@ def compute_cov_a(a: torch.Tensor, classname: str, layer_info: Tuple[List[int], 
         else:
             # This handles the standard 2D (Batch, Features) tensor
             cov_a = a.t() @ a / batch_size
-        # --- END FIX ---
     
     return cov_a
 
 @torch.jit.script
-def compute_cov_g(g: torch.Tensor, classname: str, layer_info: Tuple[List[int], List[int], List[int], int], fast_cnn: bool, is_add_bias: bool) -> torch.Tensor:
+def compute_cov_g(g: torch.Tensor, classname: str, layer_info: Tuple[List[int], List[int], List[int], List[int], int], fast_cnn: bool, is_add_bias: bool) -> torch.Tensor:
     """
     JIT-compiled function to compute the covariance matrix of pre-activation gradients 'g'.
 
     --- MODIFIED TO SUPPORT 3D TENSORS FOR LINEAR LAYERS ---
+    --- MODIFIED TO SUPPORT DILATED CONVOLUTIONS (SIGNATURE CHANGE) ---
     """
     batch_size = g.size(0)
     
@@ -118,7 +124,9 @@ def compute_cov_g(g: torch.Tensor, classname: str, layer_info: Tuple[List[int], 
         g_ = g * batch_size
         cov_g = g_.t() @ g_ / g.size(0)
     elif classname == 'Conv2d':
-        _, _, _, groups = layer_info
+        # --- START FIX: Unpack new layer_info tuple ---
+        _, _, _, _, groups = layer_info
+        # --- END FIX ---
         spatial_size = g.size(2) * g.size(3)
         if fast_cnn:
             g = g.sum(dim=(2, 3))
@@ -134,7 +142,6 @@ def compute_cov_g(g: torch.Tensor, classname: str, layer_info: Tuple[List[int], 
             g_ = g * batch_size
             cov_g = g_.t() @ g_ / g.size(0)
     else: # Linear
-        # --- START FIX ---
         if g.dim() == 3:
             # This handles the (Batch, SeqLen, Features) tensor from attention's backward pass
             # We reshape it to (Batch * SeqLen, Features)
@@ -144,7 +151,6 @@ def compute_cov_g(g: torch.Tensor, classname: str, layer_info: Tuple[List[int], 
         g_ = g * batch_size
         # Note: We use the original batch_size for normalization as per the KFAC implementation style
         cov_g = g_.t() @ g_ / batch_size
-        # --- END FIX ---
             
     return cov_g
 
@@ -157,7 +163,7 @@ class KFACOptimizer(optim.Optimizer):
     K-FAC optimizer with optional low-rank approximation and Fisher update subsampling.
     """
     def __init__(self, model, lr=0.1, momentum=0.9, stat_decay=0.99, kl_clip=0.001, 
-                 damping=1e-2, weight_decay=0, fast_cnn=False, Ts=1, Tf=10, 
+                 damping=1e-2, weight_decay=0, fast_cnn=True, Ts=1, Tf=10, 
                  kfac_approx_rank=None, fisher_frac=1.0):
         """
         Args:
@@ -240,9 +246,11 @@ class KFACOptimizer(optim.Optimizer):
             classname = module.__class__.__name__
             is_add_bias = classname == 'AddBias'
             
-            layer_info = ([], [], [], 1) # Default for non-conv layers
+            # --- START FIX: MODIFIED TO SUPPORT DILATED CONVOLUTIONS ---
+            layer_info = ([], [], [], [], 1) # Default for non-conv layers
             if classname == 'Conv2d':
-                layer_info = (module.kernel_size, module.stride, module.padding, module.groups)
+                layer_info = (module.kernel_size, module.stride, module.padding, module.dilation, module.groups)
+            # --- END FIX ---
             
             aa = compute_cov_a(a, classname, layer_info, is_add_bias)
             
@@ -271,9 +279,11 @@ class KFACOptimizer(optim.Optimizer):
             classname = module.__class__.__name__
             is_add_bias = classname == 'AddBias'
             
-            layer_info = ([], [], [], 1) # Default for non-conv layers
+            # --- START FIX: MODIFIED TO SUPPORT DILATED CONVOLUTIONS ---
+            layer_info = ([], [], [], [], 1) # Default for non-conv layers
             if classname == 'Conv2d':
-                layer_info = (module.kernel_size, module.stride, module.padding, module.groups)
+                layer_info = (module.kernel_size, module.stride, module.padding, module.dilation, module.groups)
+            # --- END FIX ---
 
             gg = compute_cov_g(g, classname, layer_info, self.fast_cnn, is_add_bias)
             
@@ -600,7 +610,8 @@ if __name__ == '__main__':
         def __init__(self):
             super().__init__()
             # A more complex model to better showcase KFAC
-            self.conv1 = nn.Conv2d(6, 16, kernel_size=3, stride=1, padding=1)
+            # Example with a dilated convolution
+            self.conv1 = nn.Conv2d(6, 16, kernel_size=3, stride=1, padding=2, dilation=2)
             self.fc = nn.Linear(16 * 10 * 10, 5)
             self.recurrent_hidden_state_size = 1 # Dummy value
 
@@ -623,6 +634,9 @@ if __name__ == '__main__':
     class DummyArgs:
         def __init__(self):
             self.container_size = (10, 10)
+            self.use_popart = False # Set to True to test POP-ART
+            self.popart_beta = 0.99
+            self.device = 'cpu'
 
     # --- How to create the ACKTR agent ---
     actor_critic_model = DummyActorCritic()
@@ -632,16 +646,17 @@ if __name__ == '__main__':
         actor_critic=actor_critic_model,
         value_loss_coef=0.5,
         entropy_coef=0.01,
-        invaild_coef=1.0,
+        invaild_coef=0.01,
         acktr=True,
-        lr=0.01,             # KFAC learning rate
-        kfac_clip=0.01,     # KFAC kl_clip
+        lr=0.01,          # KFAC learning rate
+        kfac_clip=0.01,   # KFAC kl_clip
         kfac_damping=0.001, # KFAC damping
         use_amp=False,      # Set to True if using a CUDA GPU
         args=DummyArgs()
     )
 
     print("Successfully created ACKTR agent with optimized KFAC optimizer.")
+    print("Optimizer now correctly handles dilated convolutions.")
     print("Optimizer:", acktr_agent.optimizer)
     if acktr_agent.use_amp:
         print("Automatic Mixed Precision (AMP) is enabled.")

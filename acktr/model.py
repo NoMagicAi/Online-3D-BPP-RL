@@ -1,4 +1,3 @@
-# acktr/model.py
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,28 +13,400 @@ class Flatten(nn.Module):
     def forward(self, x):
         return x.view(x.size(0), -1)
 
+#==============================================================================
+# --- Base Class Definition ---
+#==============================================================================
+
+class NNBase(nn.Module):
+    """
+    Base class for neural network modules. It defines the basic properties
+    like recurrence and hidden state size.
+    """
+    def __init__(self, recurrent, recurrent_input_size, hidden_size):
+        super(NNBase, self).__init__()
+        self._hidden_size = hidden_size
+        self._recurrent = recurrent
+
+    @property
+    def is_recurrent(self):
+        return self._recurrent
+
+    @property
+    def recurrent_hidden_state_size(self):
+        if self._recurrent:
+            return self._hidden_size
+        return 1
+
+    @property
+    def output_size(self):
+        return self._hidden_size
+
+#==============================================================================
+# --- Start of Lightweight Architecture ---
+#==============================================================================
+
+class EESP(nn.Module):
+    """
+    Efficient ESPNet block. This is the core building block of the new
+    feature extractor. It uses group convolutions and hierarchical feature
+    fusion to efficiently process features.
+    """
+    def __init__(self, in_channels, out_channels, stride=1, k=4, dilation_rates=[1, 2, 4, 8]):
+        super(EESP, self).__init__()
+        assert len(dilation_rates) == k, "Number of branches should match k"
+        self.k = k
+        # Calculate the number of channels for each parallel branch
+        self.split_channels = [out_channels // k] * k
+        self.split_channels[0] += out_channels - sum(self.split_channels)  # account for remainder
+
+        # 1x1 projection to reduce channels before splitting
+        self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.branches = nn.ModuleList()
+        # Create k parallel branches with different dilation rates
+        for i in range(k):
+            d = dilation_rates[i]
+            self.branches.append(
+                nn.Conv2d(
+                    self.split_channels[i], self.split_channels[i],
+                    kernel_size=3, stride=stride,
+                    padding=d, dilation=d,
+                    groups=self.split_channels[i],      # depthwise convolution
+                    bias=False
+                )
+            )
+
+        # Pointwise convolution to merge features
+        self.pointwise = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
+        self.bn = nn.BatchNorm2d(out_channels)
+        # ARCHITECTURAL IMPROVEMENT: Changed ReLU to LeakyReLU for consistency.
+        self.relu = nn.LeakyReLU(inplace=False)
+
+    def forward(self, x):
+        # Initial projection
+        x = self.proj(x)
+        # Split tensor for parallel branches
+        splits = torch.split(x, self.split_channels, dim=1)
+        outputs = []
+        # Process each branch
+        for idx, branch in enumerate(self.branches):
+            out = branch(splits[idx])
+            # Hierarchical Feature Fusion (HFF)
+            if idx > 0:
+                out = out + outputs[idx - 1]
+            outputs.append(out)
+        # Concatenate and process merged features
+        x = torch.cat(outputs, dim=1)
+        x = self.pointwise(x)
+        x = self.bn(x)
+        return self.relu(x)
+
+class SeparableConv2d(nn.Module):
+    """
+    Depthwise separable 2D convolution. Used in helper modules and heads.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, bias=False):
+        super(SeparableConv2d, self).__init__()
+        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size,
+                                     stride=stride, padding=padding, dilation=dilation, groups=in_channels, bias=bias)
+        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=bias)
+
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        return x
+
+def init_(m):
+    """
+    Initializes weights of the given module.
+    """
+    if isinstance(m, SeparableConv2d):
+        nn.init.kaiming_normal_(m.depthwise.weight, nonlinearity='leaky_relu')
+        if m.depthwise.bias is not None:
+            nn.init.constant_(m.depthwise.bias, 0)
+        nn.init.kaiming_normal_(m.pointwise.weight, nonlinearity='leaky_relu')
+        if m.pointwise.bias is not None:
+            nn.init.constant_(m.pointwise.bias, 0)
+    elif isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+        # EESP uses BatchNorm, so kaiming_normal_ is a good choice
+        if not isinstance(m, (EESP)): # EESP has its own init logic implicitly
+             nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu')
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+    elif isinstance(m, nn.Linear):
+        nn.init.orthogonal_(m.weight)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+    return m
+
+class AddCoords(nn.Module):
+    """
+    Adds coordinate channels to the input tensor.
+    """
+    def __init__(self, with_r=False):
+        super().__init__()
+        self.with_r = with_r
+
+    def forward(self, x):
+        b, _, h, w = x.size()
+        xx_channel = torch.arange(w, device=x.device).float()
+        yy_channel = torch.arange(h, device=x.device).float()
+        xx_channel = (xx_channel.repeat(b, 1, h, 1) / (w - 1)) * 2 - 1
+        yy_channel = (yy_channel.repeat(b, 1, w, 1).permute(0, 1, 3, 2) / (h - 1)) * 2 - 1
+        ret = torch.cat([x, xx_channel, yy_channel], dim=1)
+        if self.with_r:
+            rr = torch.sqrt(torch.pow(xx_channel - 0.5, 2) + torch.pow(yy_channel - 0.5, 2))
+            ret = torch.cat([ret, rr], dim=1)
+        return ret
+
+class CoordConv(nn.Module):
+    """
+    A separable convolutional layer that first adds coordinate channels.
+    """
+    def __init__(self, in_channels, out_channels, with_r=False, **kwargs):
+        super().__init__()
+        self.addcoords = AddCoords(with_r=with_r)
+        coord_channels = 3 if with_r else 2
+        self.conv = init_(SeparableConv2d(in_channels + coord_channels, out_channels, **kwargs))
+
+    def forward(self, x):
+        x = self.addcoords(x)
+        x = self.conv(x)
+        return x
+
+class h_swish(nn.Module):
+    def forward(self, x):
+        return x * F.relu6(x + 3) / 6
+
+class CoordAttn(nn.Module):
+    """
+    Coordinate Attention Block.
+    """
+    def __init__(self, inp, oup, reduction=32):
+        super(CoordAttn, self).__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        mip = max(8, inp // reduction)
+        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = h_swish()
+        self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        identity = x
+        n, c, h, w = x.size()
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+        return identity * a_w * a_h
+
+class ResidualCoordAttnBlock(nn.Module):
+    """
+    A residual block with Coordinate Attention, using separable convolution.
+    """
+    def __init__(self, in_channels):
+        super().__init__()
+        self.attn = CoordAttn(in_channels, in_channels)
+        self.conv = init_(SeparableConv2d(in_channels, in_channels, kernel_size=1, stride=1))
+
+    def forward(self, x):
+        res = self.attn(x)
+        res = self.conv(res)
+        return x + res
+
+class UpEESP(nn.Module):
+    """
+    Upsampling block for the EESP-Net decoder. It uses ConvTranspose2d for
+    upsampling and an EESP block to process the concatenated features from
+    the skip connection and the upsampled path.
+    """
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        # The ConvTranspose2d layer takes the input from the layer below (x1),
+        # which has 'in_channels' channels, and it halves the channel count.
+        self.up = init_(nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2))
+        # The EESP block processes the concatenated tensor. The concatenated tensor
+        # has 'in_channels' because it's the sum of the upsampled tensor's channels
+        # (in_channels / 2) and the skip connection's channels (in_channels / 2).
+        self.conv = EESP(in_channels, out_channels, stride=1)
+
+
+    def forward(self, x1, x2):
+        # x1 is from the lower layer, x2 is the skip connection
+        x1 = self.up(x1)
+        # Pad to handle potential size mismatches
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2])
+        # Concatenate skip connection and upsampled features
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
+
+class BottleneckResidualBlock(nn.Module):
+    """
+    An optimized residual block using a bottleneck design and dilated convolutions.
+    This increases the receptive field and improves efficiency.
+    """
+    def __init__(self, channels, bottleneck_channels, dilation=1):
+        super().__init__()
+        # Padding must be calculated to maintain HxW dimensions with dilation
+        # For a 3x3 kernel, padding = dilation.
+        padding = dilation
+
+        self.conv_block = nn.Sequential(
+            # 1x1 Conv to reduce channels (the "bottleneck")
+            init_(nn.Conv2d(channels, bottleneck_channels, kernel_size=1, bias=False)),
+            nn.BatchNorm2d(bottleneck_channels),
+            nn.LeakyReLU(inplace=False),
+
+            # Dilated 3x3 Separable Conv for efficient feature extraction
+            init_(SeparableConv2d(bottleneck_channels, bottleneck_channels, kernel_size=3, padding=padding, dilation=dilation, bias=False)),
+            nn.BatchNorm2d(bottleneck_channels),
+            nn.LeakyReLU(inplace=False),
+
+            # 1x1 Conv to restore the original channel dimension
+            init_(nn.Conv2d(bottleneck_channels, channels, kernel_size=1, bias=False)),
+            nn.BatchNorm2d(channels)
+        )
+        self.final_activation = nn.LeakyReLU(inplace=False)
+
+    def forward(self, x):
+        identity = x
+        out = self.conv_block(x)
+        # Add the original input (skip connection) and apply final activation
+        return self.final_activation(identity + out)
+
+
+class EESPNetFeatureExtractor(NNBase):
+    """
+    An optimized, fully-convolutional feature extractor using an encoder-decoder
+    structure to produce a full-resolution feature map efficiently.
+    """
+    def __init__(self, num_inputs, recurrent=False, hidden_size=512, width=100, length=100):
+        super(EESPNetFeatureExtractor, self).__init__(recurrent, num_inputs, hidden_size)
+
+        self.width = width
+        self.length = length
+
+        # --- Encoder Body ---
+        self.inc_conv = CoordConv(num_inputs, 64, kernel_size=3, padding=1)
+
+        bottleneck_channels = 16
+        self.body = nn.Sequential(
+            BottleneckResidualBlock(64, bottleneck_channels, dilation=1),
+            BottleneckResidualBlock(64, bottleneck_channels, dilation=2),
+            BottleneckResidualBlock(64, bottleneck_channels, dilation=4)
+        )
+
+        # Downsampling "Encoder" path
+        self.final_downsample = nn.Sequential(
+            init_(SeparableConv2d(64, 64, kernel_size=3, stride=2, padding=1)),
+            nn.LeakyReLU(inplace=False),
+            init_(SeparableConv2d(64, 64, kernel_size=3, stride=2, padding=1)),
+            nn.LeakyReLU(inplace=False),
+            init_(SeparableConv2d(64, 64, kernel_size=3, stride=2, padding=1)),
+            nn.LeakyReLU(inplace=False),
+        )
+
+        # --- NEW: Upsampling "Decoder" Path ---
+        # This block brings the feature map back to the original resolution.
+        self.upsample_head = nn.Sequential(
+            # Upsample 1
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            init_(SeparableConv2d(64, 64, kernel_size=3, padding=1)),
+            nn.LeakyReLU(inplace=False),
+            # Upsample 2
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            init_(SeparableConv2d(64, 64, kernel_size=3, padding=1)),
+            nn.LeakyReLU(inplace=False),
+            # Upsample 3
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            init_(SeparableConv2d(64, 32, kernel_size=3, padding=1)), # Reduce final channels
+            nn.LeakyReLU(inplace=False),
+        )
+
+        # --- MODIFIED: Actor and Critic Heads ---
+        # The heads now use AdaptiveAvgPool2d to handle full-resolution input efficiently.
+        # This makes them independent of the specific width/length of the input images.
+        POOL_OUTPUT_SIZE = 4 # A tunable hyperparameter for the pooling layer
+
+        # Renamed from actor_head to orientation_head for clarity
+        orientation_linear_in_features = 128 * POOL_OUTPUT_SIZE * POOL_OUTPUT_SIZE
+        self.orientation_head = nn.Sequential(
+            init_(SeparableConv2d(32, 128, kernel_size=1)), # Takes 32 channels from upsampler
+            nn.LeakyReLU(inplace=False),
+            nn.AdaptiveAvgPool2d((POOL_OUTPUT_SIZE, POOL_OUTPUT_SIZE)),
+            Flatten(),
+            init_(nn.Linear(orientation_linear_in_features, hidden_size)),
+            nn.LayerNorm(hidden_size),
+            nn.LeakyReLU(inplace=False)
+        )
+
+        critic_linear_in_features = 64 * POOL_OUTPUT_SIZE * POOL_OUTPUT_SIZE
+        self.critic_head = nn.Sequential(
+            init_(SeparableConv2d(32, 64, kernel_size=1)), # Takes 32 channels from upsampler
+            nn.LeakyReLU(inplace=False),
+            nn.AdaptiveAvgPool2d((POOL_OUTPUT_SIZE, POOL_OUTPUT_SIZE)),
+            Flatten(),
+            init_(nn.Linear(critic_linear_in_features, hidden_size)),
+            nn.LayerNorm(hidden_size)
+        )
+
+        self.critic_linear = init_(nn.Linear(hidden_size, 1))
+        self.train()
+
+    def forward(self, inputs, rnn_hxs, masks):
+        x = inputs.view(-1, 6, self.width, self.length)
+
+        # --- Full Encoder-Decoder Pass ---
+        x = self.inc_conv(x)
+        x = self.body(x)
+        downsampled_features = self.final_downsample(x)
+        # The output `shared_features` is now full-resolution
+        shared_features = self.upsample_head(downsampled_features)
+
+        # Heads now operate on the full-resolution map
+        orientation_features = self.orientation_head(shared_features)
+        critic_features = self.critic_head(shared_features)
+        value = self.critic_linear(critic_features)
+
+        # We now pass the full-resolution map out of the base model
+        return value, orientation_features, shared_features, rnn_hxs
+
+
+#==============================================================================
+# --- End of Lightweight Architecture ---
+#==============================================================================
+
+
 class Policy(nn.Module):
     def __init__(self, obs_shape, action_space, base=None, base_kwargs=None):
         super(Policy, self).__init__()
         if base_kwargs is None:
             base_kwargs = {}
-        
-        base = CNNPro
-        
-        # --- MODIFICATION ---
-        # Get width and length from the new action space indices
+
+        # Use the EESPNetFeatureExtractor as the base
+        base = EESPNetFeatureExtractor
+
         width = action_space.nvec[1]
         length = action_space.nvec[2]
-        
+
         self.base = base(num_inputs=6, width=width, length=length, **base_kwargs)
 
         hidden_size = self.base.output_size
 
-        # The order of these definitions doesn't change
         self.dist_o = Categorical(hidden_size, 2)
         self.dist_x = Categorical(hidden_size + 2, width)
         self.dist_y = Categorical(hidden_size + 2 + width, length)
-        
+
     @property
     def is_recurrent(self):
         return self.base.is_recurrent
@@ -48,40 +419,37 @@ class Policy(nn.Module):
         raise NotImplementedError
 
     def get_value(self, inputs, rnn_hxs, masks):
-        value, _, _ = self.base(inputs, rnn_hxs, masks)
+        value, _, _, _ = self.base(inputs, rnn_hxs, masks)
         return value
 
     def act(self, inputs, rnn_hs, masks, deterministic=False):
-        value, actor_features, rnn_hs = self.base(inputs, rnn_hs, masks)
-        
+        value, orientation_features, shared_features, rnn_hs = self.base(inputs, rnn_hs, masks)
+
         obs_image = inputs.view(-1, 6, self.base.width, self.base.length)
         mask_o0, mask_o1 = obs_image[:, 4, :, :], obs_image[:, 5, :, :]
-        
+
         o_mask_0_valid = mask_o0.any(dim=(-1,-2)).float()
         o_mask_1_valid = mask_o1.any(dim=(-1,-2)).float()
         o_mask = torch.stack([o_mask_0_valid, o_mask_1_valid], dim=1)
-        
-        dist_o, _, _ = self.dist_o(actor_features, o_mask)
+
+        dist_o, _, _ = self.dist_o(orientation_features, o_mask)
         action_o = dist_o.mode() if deterministic else dist_o.sample()
 
         o_one_hot = F.one_hot(action_o.squeeze(-1), num_classes=2).float()
-        x_input = torch.cat([actor_features, o_one_hot], dim=1)
-        
+        x_input = torch.cat([orientation_features, o_one_hot], dim=1)
+
         condition = (action_o == 0).view(-1, 1, 1)
         mask_for_o = torch.where(condition, mask_o0, mask_o1)
 
         x_mask = mask_for_o.any(dim=-1).float()
         dist_x, _, _ = self.dist_x(x_input, x_mask)
         action_x = dist_x.mode() if deterministic else dist_x.sample()
-        
+
         x_one_hot = F.one_hot(action_x.squeeze(-1), num_classes=self.base.width).float()
-        y_input = torch.cat([actor_features, o_one_hot, x_one_hot], dim=1)
-        
-        # --- THIS IS THE FIX ---
-        # Expand action_x to a 3D tensor to be used as an index for the 3D mask_for_o
+        y_input = torch.cat([orientation_features, o_one_hot, x_one_hot], dim=1)
+
         index = action_x.unsqueeze(2).expand(-1, -1, self.base.length)
         y_mask = torch.gather(mask_for_o, 1, index).squeeze(1).float()
-        # --- END FIX ---
 
         dist_y, _, _ = self.dist_y(y_input, y_mask)
         action_y = dist_y.mode() if deterministic else dist_y.sample()
@@ -90,159 +458,44 @@ class Policy(nn.Module):
         log_prob_x = dist_x.log_prob(action_x.squeeze(-1))
         log_prob_y = dist_y.log_prob(action_y.squeeze(-1))
         action_log_probs = (log_prob_o + log_prob_x + log_prob_y).unsqueeze(-1)
-        
+
         action = torch.cat([action_o, action_x, action_y], dim=1)
         return value, action, action_log_probs, rnn_hs
 
     def evaluate_actions(self, inputs, rnn_hs, masks, action, gt_masks):
-        value, actor_features, rnn_hs = self.base(inputs, rnn_hs, masks)
-        
+        value, orientation_features, shared_features, rnn_hs = self.base(inputs, rnn_hs, masks)
         action_o, action_x, action_y = action[:, 0], action[:, 1], action[:, 2]
-        
-        # --- Part 1: 'o' distribution (unchanged) ---
+
         mask_o0 = gt_masks[:, 0]
         mask_o1 = gt_masks[:, 1]
         o_mask_0_valid = mask_o0.any(dim=(-1, -2)).float()
         o_mask_1_valid = mask_o1.any(dim=(-1, -2)).float()
         o_mask = torch.stack([o_mask_0_valid, o_mask_1_valid], dim=1)
-        dist_o, _, _ = self.dist_o(actor_features, o_mask)
+        dist_o, _, _ = self.dist_o(orientation_features, o_mask)
 
         o_one_hot = F.one_hot(action_o, num_classes=2).float()
-        x_input = torch.cat([actor_features, o_one_hot], dim=1)
-        
-        # --- OPTIMIZATION 1: Calculate the chosen mask ONCE ---
-        # This mask is needed for the 'x' distribution, 'y' distribution, and the loss.
-        # Let gt_masks be (B, 2, W, L). This selects a mask of shape (B, W, L) based on action_o.
+        x_input = torch.cat([orientation_features, o_one_hot], dim=1)
+
         condition = (action_o == 0).view(-1, 1, 1)
         mask_for_o = torch.where(condition, mask_o0, mask_o1)
-        
-        # --- Part 2: 'x' distribution ---
+
         x_mask = mask_for_o.any(dim=-1).float()
         dist_x, _, _ = self.dist_x(x_input, x_mask)
 
         x_one_hot = F.one_hot(action_x, num_classes=self.base.width).float()
-        y_input = torch.cat([actor_features, o_one_hot, x_one_hot], dim=1)
-        
-        # --- OPTIMIZATION 2: Use Advanced Indexing for `y_mask` ---
-        # This is more direct and faster than the original view-expand-gather-squeeze sequence.
-        # It selects the row `action_x[i]` from `mask_for_o[i]` for each item in the batch.
+        y_input = torch.cat([orientation_features, o_one_hot, x_one_hot], dim=1)
+
         batch_indices = torch.arange(mask_for_o.size(0), device=action_x.device)
         y_mask = mask_for_o[batch_indices, action_x].float()
-        
-        # --- Part 3: 'y' distribution ---
+
         dist_y, _, _ = self.dist_y(y_input, y_mask)
-        
-        # --- OPTIMIZATION 3: Reuse `mask_for_o` for loss calculation ---
-        # The original code recalculated this exact same tensor.
+
         probs_x, probs_y = dist_x.probs, dist_y.probs
         prob_map = probs_x.unsqueeze(2) * probs_y.unsqueeze(1)
         infeasibility_mask = 1.0 - mask_for_o.float()
         infeasibility_loss = torch.mean(prob_map * infeasibility_mask)
 
-        # --- Final calculations (unchanged) ---
         action_log_probs = dist_o.log_prob(action_o) + dist_x.log_prob(action_x) + dist_y.log_prob(action_y)
         dist_entropy = dist_o.entropy().mean() + dist_x.entropy().mean() + dist_y.entropy().mean()
-        
+
         return value, action_log_probs, dist_entropy, rnn_hs, infeasibility_loss
-class NNBase(nn.Module):
-    # ... (This class is unchanged) ...
-    def __init__(self, recurrent, recurrent_input_size, hidden_size):
-        super(NNBase, self).__init__()
-        self._hidden_size = hidden_size
-        self._recurrent = recurrent
-    @property
-    def is_recurrent(self):
-        return self._recurrent
-    @property
-    def recurrent_hidden_state_size(self):
-        if self._recurrent:
-            return self._hidden_size
-        return 1
-    @property
-    def output_size(self):
-        return self._hidden_size
-
-def init_(m):
-    if isinstance(m, nn.Conv2d):
-        nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu')
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    return m
-
-class CNNPro(NNBase):
-    def __init__(self, num_inputs, recurrent=False, hidden_size=512, width=100, length=100):
-        super(CNNPro, self).__init__(recurrent, num_inputs, hidden_size)
-        
-        self.width = width
-        self.length = length
-
-        init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.constant_(x, 0), nn.init.calculate_gain('leaky_relu'))
-        
-        # 1. Define the shared convolutional feature extractor first
-        self.shared_conv = nn.Sequential(
-            # Block 1: stride 1
-            init_(nn.Conv2d(num_inputs, num_inputs, kernel_size=3, stride=1, padding=1, groups=num_inputs, bias=False)),
-            init_(nn.Conv2d(num_inputs, 64, kernel_size=1, stride=1, padding=0, bias=False)),
-            nn.LeakyReLU(),
-
-            # Block 2: stride 2 (DOWNSAMPLE)
-            init_(nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1, groups=64, bias=False)),
-            init_(nn.Conv2d(64, 64, kernel_size=1, stride=1, padding=0, bias=False)),
-            nn.LeakyReLU(),
-
-            # Block 3: stride 2 (DOWNSAMPLE)
-            init_(nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1, groups=64, bias=False)),
-            init_(nn.Conv2d(64, 64, kernel_size=1, stride=1, padding=0, bias=False)),
-            nn.LeakyReLU(),
-
-            # Block 4: stride 2 (DOWNSAMPLE)
-            init_(nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1, groups=64, bias=False)),
-            init_(nn.Conv2d(64, 64, kernel_size=1, stride=1, padding=0, bias=False)),
-            nn.LeakyReLU(),
-
-            # Block 5: stride 1
-            init_(nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, groups=64, bias=False)),
-            init_(nn.Conv2d(64, 64, kernel_size=1, stride=1, padding=0, bias=False)),
-            nn.LeakyReLU()
-        )
-
-        # --- DYNAMIC CALCULATION ---
-        # Create a dummy input tensor and pass it through the conv layers to find the output shape
-        with torch.no_grad():
-            dummy_input = torch.zeros(1, num_inputs, self.width, self.length)
-            conv_output = self.shared_conv(dummy_input)
-            # The shape of conv_output is (1, channels, final_length, final_width)
-            final_conv_length = conv_output.shape[2]
-            final_conv_width = conv_output.shape[3]
-        # --- END DYNAMIC CALCULATION ---
-        
-        # 2. Actor head - now uses the dynamically calculated size
-        actor_linear_in_features = 8 * final_conv_length * final_conv_width
-        self.actor_head = nn.Sequential(
-            init_(nn.Conv2d(64, 8, 1, stride=1)),
-            nn.LeakyReLU(),
-            Flatten(),
-            init_(nn.Linear(actor_linear_in_features, hidden_size)),
-            nn.LeakyReLU()
-        )
-
-        # 3. Critic head - also uses the dynamically calculated size
-        critic_linear_in_features = 4 * final_conv_length * final_conv_width
-        self.critic_head = nn.Sequential(
-            init_(nn.Conv2d(64, 4, 1, stride=1)),
-            nn.LeakyReLU(),
-            Flatten(),
-            init_(nn.Linear(critic_linear_in_features, hidden_size))
-        )
-
-        self.critic_linear = init_(nn.Linear(hidden_size, 1))
-        self.train()
-    
-    # The 'forward' method does not need to be changed
-    def forward(self, inputs, rnn_hxs, masks):
-        x = inputs.view(-1, 6, self.width, self.length)
-        shared_features = self.shared_conv(x)
-        actor_features = self.actor_head(shared_features)
-        critic_features = self.critic_head(shared_features)
-        value = self.critic_linear(critic_features)
-        return value, actor_features, rnn_hxs
