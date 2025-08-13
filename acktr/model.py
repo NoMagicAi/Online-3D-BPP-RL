@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 # The custom Categorical class is a wrapper that includes the final linear layer
 from acktr.distributions import Categorical
@@ -17,6 +18,46 @@ class Flatten(nn.Module):
 # --- Base Class Definition ---
 #==============================================================================
 
+class GhostModule(nn.Module):
+    """
+    Ghost Module for efficient feature map generation.
+    This module replaces a standard convolutional layer.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size=1, ratio=2, dw_kernel_size=3, stride=1, relu=True):
+        super(GhostModule, self).__init__()
+        self.out_channels = out_channels
+        
+        # Calculate the number of intrinsic channels (the artist's work)
+        init_channels = math.ceil(out_channels / ratio)
+        # The rest are ghost channels
+        new_channels = init_channels * (ratio - 1)
+
+        # Primary convolution to generate intrinsic feature maps
+        self.primary_conv = nn.Sequential(
+            nn.Conv2d(in_channels, init_channels, kernel_size, stride, padding=kernel_size//2, bias=False),
+            nn.BatchNorm2d(init_channels),
+            nn.ReLU(inplace=True) if relu else nn.Sequential(),
+        )
+
+        # Cheaper operation (depth-wise conv) to generate ghost features
+        self.cheap_operation = nn.Sequential(
+            nn.Conv2d(init_channels, new_channels, dw_kernel_size, 1, padding=dw_kernel_size//2, groups=init_channels, bias=False),
+            nn.BatchNorm2d(new_channels),
+            nn.ReLU(inplace=True) if relu else nn.Sequential(),
+        )
+
+    def forward(self, x):
+        # 1. Generate intrinsic features
+        x1 = self.primary_conv(x)
+        
+        # 2. Generate ghost features from intrinsic features
+        x2 = self.cheap_operation(x1)
+        
+        # 3. Concatenate and return
+        out = torch.cat([x1, x2], dim=1)
+        
+        # Trim to the exact number of output channels
+        return out[:, :self.out_channels, :, :]
 class NNBase(nn.Module):
     """
     Base class for neural network modules. It defines the basic properties
@@ -45,6 +86,54 @@ class NNBase(nn.Module):
 # --- Start of Lightweight Architecture ---
 #==============================================================================
 
+class GhostEESP(nn.Module):
+    """
+    An EESP block where the parameter-heavy 1x1 convolutions are
+    replaced by more efficient GhostModules.
+    """
+    def __init__(self, in_channels, out_channels, stride=1, k=4, dilation_rates=[1, 2, 4, 8]):
+        super(GhostEESP, self).__init__()
+        assert len(dilation_rates) == k, "Number of branches should match k"
+        self.k = k
+        self.split_channels = [out_channels // k] * k
+        self.split_channels[0] += out_channels - sum(self.split_channels)
+
+        # --- MODIFICATION ---
+        # Replace the 1x1 projection with a GhostModule
+        self.proj = GhostModule(in_channels, out_channels, relu=False) # ReLU will be applied later
+        
+        # The depth-wise branches are already cheap, so we keep them
+        self.branches = nn.ModuleList()
+        for i in range(k):
+            d = dilation_rates[i]
+            self.branches.append(
+                nn.Conv2d(
+                    self.split_channels[i], self.split_channels[i],
+                    kernel_size=3, stride=stride, padding=d, dilation=d,
+                    groups=self.split_channels[i], bias=False
+                )
+            )
+
+        # --- MODIFICATION ---
+        # Replace the final pointwise convolution with a GhostModule
+        self.pointwise = GhostModule(out_channels, out_channels, relu=False)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.LeakyReLU(inplace=False)
+
+    def forward(self, x):
+        x = self.proj(x) # Initial projection using GhostModule
+        splits = torch.split(x, self.split_channels, dim=1)
+        outputs = []
+        for idx, branch in enumerate(self.branches):
+            out = branch(splits[idx])
+            if idx > 0:
+                out = out + outputs[idx - 1]
+            outputs.append(out)
+
+        x = torch.cat(outputs, dim=1)
+        x = self.pointwise(x) # Merging using GhostModule
+        x = self.bn(x)
+        return self.relu(x)
 class EESP(nn.Module):
     """
     Efficient ESPNet block. This is the core building block of the new
@@ -285,6 +374,205 @@ class BottleneckResidualBlock(nn.Module):
         return self.final_activation(identity + out)
 
 
+class FinalFusionNet(NNBase):
+    """
+    A drop-in replacement that fuses all our concepts:
+    1. A U-Net structure for memory efficiency.
+    2. Ghost modules for computational efficiency.
+    3. Coordinate Convolution for input spatial awareness.
+    4. Coordinate Attention for feature-level spatial focus.
+    
+    Its API is identical to the previous networks.
+    """
+    def __init__(self, num_inputs, recurrent=False, hidden_size=512, width=100, length=100):
+        super(FinalFusionNet, self).__init__(recurrent, num_inputs, hidden_size)
+
+        self.width = width
+        self.length = length
+
+        # --- Encoder Path ---
+        ## NEW: Replace the first block with CoordConv for spatial awareness ##
+        self.level1_down = CoordConv(num_inputs, 32, kernel_size=3, stride=2, padding=1)
+        
+        self.level2_down = GhostEESP(32, 64, stride=2)
+        self.level3_down = GhostEESP(64, 128, stride=2)
+
+        # --- Bottleneck ---
+        self.bottleneck = GhostEESP(128, 128, stride=1)
+        
+        ## NEW: Add Coordinate Attention after the bottleneck ##
+        self.attn = ResidualCoordAttnBlock(128)
+
+        # --- Decoder Path (Upsampling) ---
+        self.level3_up = GhostUpEESP(128, 64)
+        self.level2_up = GhostUpEESP(64, 32)
+        
+        # --- Final layers are identical ---
+        self.final_upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.output_conv = init_(nn.Conv2d(32, 32, kernel_size=1, stride=1))
+
+        # --- Heads are identical ---
+        # (Actor and Critic Heads are unchanged)
+        POOL_OUTPUT_SIZE = 4
+        orientation_linear_in_features = 128 * POOL_OUTPUT_SIZE * POOL_OUTPUT_SIZE
+        self.orientation_head = nn.Sequential(
+            init_(SeparableConv2d(128, 128, kernel_size=1)),
+            nn.LeakyReLU(inplace=False),
+            nn.AdaptiveAvgPool2d((POOL_OUTPUT_SIZE, POOL_OUTPUT_SIZE)),
+            Flatten(),
+            init_(nn.Linear(orientation_linear_in_features, hidden_size)),
+            nn.LayerNorm(hidden_size),
+            nn.LeakyReLU(inplace=False)
+        )
+        num_orientations = 2
+        self.critic_head = nn.Sequential(
+            init_(SeparableConv2d(32, 64, kernel_size=3, padding=1, bias=False)),
+            nn.LeakyReLU(inplace=False),
+            init_(SeparableConv2d(64, num_orientations, kernel_size=3, padding=1, bias=True))
+        )
+        self.softmax_temp = 1.0
+
+        self.train()
+
+    def forward(self, inputs, rnn_hxs, masks):
+        x = inputs.view(-1, 6, self.width, self.length)
+
+        # --- Encoder ---
+        skip1_out = self.level1_down(x) # The new CoordConv layer is used here
+        skip2_out = self.level2_down(skip1_out)
+        encoded = self.level3_down(skip2_out)
+
+        # --- Bottleneck ---
+        bottleneck_out = self.bottleneck(encoded)
+        bottleneck_out = self.attn(bottleneck_out) # Apply attention here
+        orientation_features = self.orientation_head(bottleneck_out)
+
+        # --- Decoder ---
+        up3_out = self.level3_up(bottleneck_out, skip2_out)
+        up2_out = self.level2_up(up3_out, skip1_out)
+        x_up = self.final_upsample(up2_out)
+        shared_features = self.output_conv(x_up)
+
+        # --- Critic Logic (unchanged) ---
+        if shared_features.shape[-2:] != (self.width, self.length):
+            shared_features = F.interpolate(
+                shared_features, size=(self.width, self.length),
+                mode='bilinear', align_corners=False
+            )
+        value_map = self.critic_head(shared_features)
+        mask_o0, mask_o1 = x[:, 4, :, :], x[:, 5, :, :]
+        action_mask = torch.stack([mask_o0, mask_o1], dim=1).bool()
+        batch_size = value_map.size(0)
+        flattened_values = value_map.view(batch_size, -1)
+        flattened_mask = action_mask.view(batch_size, -1)
+        masked_values = flattened_values.clone()
+        masked_values[~flattened_mask] = -float('inf')
+        weights = F.softmax(masked_values / self.softmax_temp, dim=1)
+        value = torch.sum(weights * flattened_values, dim=1).unsqueeze(-1)
+
+        return value, orientation_features, shared_features, rnn_hxs
+
+# Place this class in your model file as an alternative to EESPNetFeatureExtractor
+class EESPNetV2(NNBase):
+    """
+    A memory-optimized U-Net style feature extractor using EESP blocks.
+    It downsamples the input early to reduce the size of activation maps
+    and uses skip connections to preserve spatial details.
+    """
+    def __init__(self, num_inputs, recurrent=False, hidden_size=512, width=100, length=100):
+        super(EESPNetV2, self).__init__(recurrent, num_inputs, hidden_size)
+
+        self.width = width
+        self.length = length
+
+        # --- Encoder Path (Downsampling) ---
+        # Each block halves the spatial dimensions and increases channel depth.
+        self.level1_down = EESP(num_inputs, 32, stride=2) # H/2, W/2
+        self.level2_down = EESP(32, 64, stride=2)         # H/4, W/4
+        self.level3_down = EESP(64, 128, stride=2)        # H/8, W/8
+
+        # --- Bottleneck ---
+        # The lowest resolution part of the network.
+        self.bottleneck = EESP(128, 128, stride=1)
+
+        # --- Decoder Path (Upsampling) ---
+        # Uses the UpEESP block you defined, which is perfect for handling skip connections.
+        self.level3_up = UpEESP(128, 64) # Takes bottleneck output + level2 skip. Output channels: 64
+        self.level2_up = UpEESP(64, 32)  # Takes level3_up output + level1 skip. Output channels: 32
+        self.level1_up = UpEESP(32, 32)  # Takes level2_up output + initial input. Output channels: 32
+
+        # Final 1x1 convolution to create the final shared feature map.
+        # This can be tuned, but 32 channels is a reasonable starting point.
+        self.output_conv = init_(nn.Conv2d(32, 32, kernel_size=1, stride=1))
+
+        # --- Actor and Critic Heads (largely unchanged) ---
+        POOL_OUTPUT_SIZE = 4
+        orientation_linear_in_features = 128 * POOL_OUTPUT_SIZE * POOL_OUTPUT_SIZE
+        self.orientation_head = nn.Sequential(
+            init_(SeparableConv2d(128, 128, kernel_size=1)), # This now takes features from the bottleneck
+            nn.LeakyReLU(inplace=False),
+            nn.AdaptiveAvgPool2d((POOL_OUTPUT_SIZE, POOL_OUTPUT_SIZE)),
+            Flatten(),
+            init_(nn.Linear(orientation_linear_in_features, hidden_size)),
+            nn.LayerNorm(hidden_size),
+            nn.LeakyReLU(inplace=False)
+        )
+
+        num_orientations = 2
+        self.critic_head = nn.Sequential(
+            init_(SeparableConv2d(32, 64, kernel_size=3, padding=1, bias=False)),
+            nn.LeakyReLU(inplace=False),
+            init_(SeparableConv2d(64, num_orientations, kernel_size=3, padding=1, bias=True))
+        )
+        self.softmax_temp = 1.0
+
+        self.train()
+
+    def forward(self, inputs, rnn_hxs, masks):
+        x = inputs.view(-1, 6, self.width, self.length)
+
+        # --- Encoder Pass ---
+        skip1_out = self.level1_down(x)    # -> (B, 32, H/2, W/2)
+        skip2_out = self.level2_down(skip1_out) # -> (B, 64, H/4, W/4)
+        encoded = self.level3_down(skip2_out) # -> (B, 128, H/8, W/8)
+
+        # --- Bottleneck Pass ---
+        bottleneck_out = self.bottleneck(encoded) # -> (B, 128, H/8, W/8)
+
+        # --- Actor Features from Bottleneck ---
+        # The actor can use the high-level semantic features from the bottleneck.
+        orientation_features = self.orientation_head(bottleneck_out)
+
+        # --- Decoder Pass with Skip Connections ---
+        up3_out = self.level3_up(bottleneck_out, skip2_out) # -> (B, 64, H/4, W/4)
+        up2_out = self.level2_up(up3_out, skip1_out)         # -> (B, 32, H/2, W/2)
+        # For the final upsampling, we need a skip connection from the original input `x`.
+        # Your UpEESP expects matching channels, so we can't directly use `x`.
+        # A simple solution is another UpEESP-like block or a simpler upsampling layer.
+        # For simplicity here, we use a standard upsample and conv.
+        x_up = F.interpolate(up2_out, scale_factor=2, mode='bilinear', align_corners=False)
+        shared_features = self.output_conv(x_up) # -> (B, 32, H, W)
+
+        # --- Critic Logic (unchanged) ---
+        if shared_features.shape[-2:] != (self.width, self.length):
+            shared_features = F.interpolate(
+                shared_features, size=(self.width, self.length),
+                mode='bilinear', align_corners=False
+            )
+        value_map = self.critic_head(shared_features)
+        mask_o0, mask_o1 = x[:, 4, :, :], x[:, 5, :, :]
+        action_mask = torch.stack([mask_o0, mask_o1], dim=1).bool()
+        batch_size = value_map.size(0)
+        flattened_values = value_map.view(batch_size, -1)
+        flattened_mask = action_mask.view(batch_size, -1)
+        masked_values = flattened_values.clone()
+        masked_values[~flattened_mask] = -float('inf')
+        weights = F.softmax(masked_values / self.softmax_temp, dim=1)
+        value = torch.sum(weights * flattened_values, dim=1).unsqueeze(-1)
+
+        # Return signature remains the same
+        return value, orientation_features, shared_features, rnn_hxs
+
 class EESPNetFeatureExtractor(NNBase):
     """
     An optimized, fully-convolutional feature extractor using an encoder-decoder
@@ -434,6 +722,123 @@ class EESPNetFeatureExtractor(NNBase):
 # --- End of Lightweight Architecture ---
 #==============================================================================
 
+class GhostUpEESP(nn.Module):
+    """
+    Upsampling block for the decoder that uses a GhostEESP block
+    to process the concatenated features from the skip connection.
+    """
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        # The ConvTranspose2d layer for upsampling remains the same.
+        self.up = init_(nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2))
+        
+        # We replace the EESP block with our new, more efficient GhostEESP block.
+        # The input channel count is 'in_channels' because it's the sum of the
+        # upsampled tensor's channels (in_channels / 2) and the skip connection's
+        # channels (in_channels / 2).
+        self.conv = GhostEESP(in_channels, out_channels, stride=1)
+
+    def forward(self, x1, x2):
+        # x1 is from the lower layer, x2 is the skip connection
+        x1 = self.up(x1)
+        # Pad to handle potential size mismatches
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
+                       diffY // 2, diffY - diffY // 2])
+        # Concatenate skip connection and upsampled features
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
+    
+class GhostedEESPNet(NNBase):
+    """
+    A drop-in replacement for EESPNetV2 that uses GhostEESP blocks
+    internally for maximum parameter and computational efficiency.
+    
+    Its API is identical to EESPNetV2.
+    """
+    def __init__(self, num_inputs, recurrent=False, hidden_size=512, width=100, length=100):
+        super(GhostedEESPNet, self).__init__(recurrent, num_inputs, hidden_size)
+
+        self.width = width
+        self.length = length
+
+        # --- Encoder Path (Downsampling) using GhostEESP ---
+        self.level1_down = GhostEESP(num_inputs, 32, stride=2)
+        self.level2_down = GhostEESP(32, 64, stride=2)
+        self.level3_down = GhostEESP(64, 128, stride=2)
+
+        # --- Bottleneck using GhostEESP ---
+        self.bottleneck = GhostEESP(128, 128, stride=1)
+
+        # --- Decoder Path (Upsampling) using GhostUpEESP ---
+        self.level3_up = GhostUpEESP(128, 64)
+        self.level2_up = GhostUpEESP(64, 32)
+        
+        # --- Final layers are identical to EESPNetV2 ---
+        self.final_upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.output_conv = init_(nn.Conv2d(32, 32, kernel_size=1, stride=1))
+
+        # Actor and Critic Heads (unchanged)
+        POOL_OUTPUT_SIZE = 4
+        orientation_linear_in_features = 128 * POOL_OUTPUT_SIZE * POOL_OUTPUT_SIZE
+        self.orientation_head = nn.Sequential(
+            init_(SeparableConv2d(128, 128, kernel_size=1)),
+            nn.LeakyReLU(inplace=False),
+            nn.AdaptiveAvgPool2d((POOL_OUTPUT_SIZE, POOL_OUTPUT_SIZE)),
+            Flatten(),
+            init_(nn.Linear(orientation_linear_in_features, hidden_size)),
+            nn.LayerNorm(hidden_size),
+            nn.LeakyReLU(inplace=False)
+        )
+        num_orientations = 2
+        self.critic_head = nn.Sequential(
+            init_(SeparableConv2d(32, 64, kernel_size=3, padding=1, bias=False)),
+            nn.LeakyReLU(inplace=False),
+            init_(SeparableConv2d(64, num_orientations, kernel_size=3, padding=1, bias=True))
+        )
+        self.softmax_temp = 1.0
+
+        self.train()
+
+    def forward(self, inputs, rnn_hxs, masks):
+        # The forward pass logic is identical to EESPNetV2
+        x = inputs.view(-1, 6, self.width, self.length)
+
+        # Encoder
+        skip1_out = self.level1_down(x)
+        skip2_out = self.level2_down(skip1_out)
+        encoded = self.level3_down(skip2_out)
+
+        # Bottleneck
+        bottleneck_out = self.bottleneck(encoded)
+        orientation_features = self.orientation_head(bottleneck_out)
+
+        # Decoder
+        up3_out = self.level3_up(bottleneck_out, skip2_out)
+        up2_out = self.level2_up(up3_out, skip1_out)
+        x_up = self.final_upsample(up2_out)
+        shared_features = self.output_conv(x_up)
+
+        # Critic Logic (unchanged)
+        # ... (the rest of the forward pass is exactly the same as EESPNetV2) ...
+        if shared_features.shape[-2:] != (self.width, self.length):
+            shared_features = F.interpolate(
+                shared_features, size=(self.width, self.length),
+                mode='bilinear', align_corners=False
+            )
+        value_map = self.critic_head(shared_features)
+        mask_o0, mask_o1 = x[:, 4, :, :], x[:, 5, :, :]
+        action_mask = torch.stack([mask_o0, mask_o1], dim=1).bool()
+        batch_size = value_map.size(0)
+        flattened_values = value_map.view(batch_size, -1)
+        flattened_mask = action_mask.view(batch_size, -1)
+        masked_values = flattened_values.clone()
+        masked_values[~flattened_mask] = -float('inf')
+        weights = F.softmax(masked_values / self.softmax_temp, dim=1)
+        value = torch.sum(weights * flattened_values, dim=1).unsqueeze(-1)
+
+        return value, orientation_features, shared_features, rnn_hxs
 
 class Policy(nn.Module):
     def __init__(self, obs_shape, action_space, base=None, base_kwargs=None):
@@ -442,7 +847,7 @@ class Policy(nn.Module):
             base_kwargs = {}
 
         # Use the EESPNetFeatureExtractor as the base
-        base = EESPNetFeatureExtractor
+        base = FinalFusionNet
 
         width = action_space.nvec[1]
         length = action_space.nvec[2]

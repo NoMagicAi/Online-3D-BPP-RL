@@ -29,7 +29,8 @@ def main(args):
 
 
 def train_model(args):
-    custom = input("please input the test name: ")
+    #custom = input("please input the test name: ")
+    custom = "training-at-grace-robot"
 
     # --- ADDED: ClearML Initialize Task ---
     task = Task.init(
