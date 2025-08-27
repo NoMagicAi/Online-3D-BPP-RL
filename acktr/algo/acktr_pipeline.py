@@ -142,15 +142,22 @@ def compute_cov_g(g: torch.Tensor, classname: str, layer_info: Tuple[List[int], 
             g_ = g * batch_size
             cov_g = g_.t() @ g_ / g.size(0)
     else: # Linear
+        norm_factor = batch_size
+        
         if g.dim() == 3:
             # This handles the (Batch, SeqLen, Features) tensor from attention's backward pass
             # We reshape it to (Batch * SeqLen, Features)
-            g = g.reshape(-1, g.size(-1))
+            effective_batch_size = g.size(0) * g.size(1)
+            g = g.reshape(effective_batch_size, g.size(-1))
+            
+            # 💡 FIX: Use the effective batch size for normalization
+            norm_factor = effective_batch_size
         
-        # The rest of the logic now works for both 2D and reshaped 3D tensors
+        # The scaling factor g_ is a convention in KFAC implementations
         g_ = g * batch_size
-        # Note: We use the original batch_size for normalization as per the KFAC implementation style
-        cov_g = g_.t() @ g_ / batch_size
+        
+        # Use the correct normalization factor for the covariance calculation
+        cov_g = g_.t() @ g_ / norm_factor
             
     return cov_g
 
@@ -490,7 +497,7 @@ class ACKTR():
                 #
                 # ⚠️ IMPORTANT: This line should still point to the final value head layer.
                 # Now we know it's a 'SplitBias' wrapper.
-                value_head_wrapper = self.actor_critic.base.critic_head[2].pointwise # <--- CONFIRM THIS IS YOUR LAYER
+                value_head_wrapper = self.actor_critic.base.critic_head_decoupled[4] # <--- CONFIRM THIS IS YOUR LAYER
 
                 ## --- CORRECTED POP-ART MODIFICATION for K-FAC ---
                 # Access the weights from the original module inside the wrapper.

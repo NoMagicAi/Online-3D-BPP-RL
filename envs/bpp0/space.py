@@ -11,10 +11,15 @@ class Space(object):
     def __init__(self, width=10, length=10, height=10):
         self.width = width
         self.length = length
-        self.height = height  # This is now a fixed constant
+        self.height = height
 
         # The state is composed of the heightmap and the stacking tree
         self.plain = np.zeros(shape=(width, length), dtype=np.int32)
+        
+        # --- ADD THIS LINE ---
+        self.box_id_map = np.zeros(shape=(width, length), dtype=np.int32)
+        # -------------------
+        
         self.stacking_tree = StackingTree()
 
     def get_stability_map(self, item_size, density=1.0):
@@ -73,9 +78,11 @@ class Space(object):
                 hypo_box.centroid[0] = r + item_x / 2.0
                 hypo_box.centroid[1] = c + item_y / 2.0
 
+                # --- UPDATE THIS CALL ---
                 if self.stacking_tree.is_placement_stable(
-                    hypo_box, self.stacking_tree.boxes
+                    hypo_box, self.stacking_tree.boxes, self.box_id_map
                 ):
+                # ----------------------
                     # If all checks pass, mark this corner as a valid placement
                     feasibility_map[r, c] = True
 
@@ -100,10 +107,15 @@ class Space(object):
             lz=item_z,
             density=density,
         )
-        self.stacking_tree.add_box_permanently(final_box)
+        # --- UPDATE THIS CALL ---
+        self.stacking_tree.add_box_permanently(final_box, self.box_id_map)
+        # ----------------------
         self.plain[x_pos : x_pos + item_x, y_pos : y_pos + item_y] = (
             surface_height + item_z
         )
+        # --- ADD THIS LINE ---
+        self.box_id_map[x_pos : x_pos + item_x, y_pos : y_pos + item_y] = final_box.id
+        # -------------------
         # NOTE: The buggy line 'self.height = max(...)' is correctly removed here.
 
     def get_ratio(self):

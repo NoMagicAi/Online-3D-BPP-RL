@@ -48,14 +48,21 @@ FixedBernoulli.mode = lambda self: torch.gt(self.probs, 0.5).float()
 
 # remove the mask
 def mask_softmax(mat, mask, dim=-1):
+    """
+    Applies a softmax after masking invalid positions.
+    Invalid positions are marked with 0 in the mask.
+    """
     mask = mask.float()
-    mat = mat + mask * 1e4
-    mat_max = torch.max(mat, dim=dim, keepdim=True)[0].detach()
-    mat_exp = torch.exp(mat - mat_max)
-    mat_exp = mat_exp * mask
-    mat_sum = torch.sum(mat_exp, dim=dim, keepdim=True)
-    mat_softmax = mat_exp / mat_sum
-    return mat_softmax
+    
+    # Create an inverse mask where invalid positions are 1.0
+    inverse_mask = 1.0 - mask
+    
+    # Subtract a very large number from the logits of invalid actions.
+    # This effectively makes their probability zero after softmax.
+    masked_mat = mat - (inverse_mask * 1e9)
+    
+    # Use PyTorch's built-in softmax, which is numerically stable.
+    return F.softmax(masked_mat, dim=dim)
 
 class Categorical(nn.Module):
 
@@ -75,12 +82,14 @@ class Categorical(nn.Module):
         ones = torch.ones_like(mask)
         inver_mask = ones - mask
 
-        lx = F.softmax(x - inver_mask * 14, dim=-1)
-        lx = lx + 1e-5
+        # Mask the original logits by subtracting a large number from invalid actions.
+        # A value like 1e9 is standard for ensuring near-zero probability.
+        masked_logits = x - inver_mask * 1e9
 
         # branch 2
-        # choose vaild actions
-        fat_cat = FixedCategorical(probs=lx)
+        # Create the distribution directly from logits. This is more numerically stable
+        # than creating it from probabilities (probs=...). PyTorch handles the softmax internally.
+        fat_cat = FixedCategorical(logits=masked_logits)
 
         # branch 1
         # minimaze invaild actions

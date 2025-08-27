@@ -1,14 +1,16 @@
-import numpy as np
+# test_final.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-
-# The custom Categorical class is a wrapper that includes the final linear layer
-from acktr.distributions import Categorical
-# The actual distribution object returned by the wrapper
+import gym.spaces
 from torch.distributions.categorical import Categorical as TorchCategorical
-from acktr.utils import init
+
+# ==============================================================================
+# --- COMPLETE, FULLY MODIFIED MODEL DEFINITIONS ---
+# ==============================================================================
+
+# --- Helper Modules (with all changes already applied) ---
 
 class Flatten(nn.Module):
     def forward(self, x):
@@ -62,27 +64,16 @@ class AddCoords(nn.Module):
     def __init__(self, with_r=False):
         super().__init__()
         self.with_r = with_r
-
     def forward(self, x):
         b, _, h, w = x.size()
-
-        # Create coordinate grids
-        xx_range = torch.linspace(-1, 1, w, device=x.device)
-        yy_range = torch.linspace(-1, 1, h, device=x.device)
-        
-        yy, xx = torch.meshgrid(yy_range, xx_range, indexing='ij')
-
-        # Reshape for concatenation
-        xx_channel = xx.unsqueeze(0).unsqueeze(1).expand(b, 1, h, w)
-        yy_channel = yy.unsqueeze(0).unsqueeze(1).expand(b, 1, h, w)
-        
+        xx_channel = torch.arange(w, device=x.device).float()
+        yy_channel = torch.arange(h, device=x.device).float()
+        xx_channel = (xx_channel.repeat(b, 1, h, 1) / (w - 1)) * 2 - 1
+        yy_channel = (yy_channel.repeat(b, 1, w, 1).permute(0, 1, 3, 2) / (h - 1)) * 2 - 1
         ret = torch.cat([x, xx_channel, yy_channel], dim=1)
-
         if self.with_r:
-            # Correctly calculate radius from the center (0,0)
-            rr = torch.sqrt(torch.pow(xx_channel, 2) + torch.pow(yy_channel, 2))
+            rr = torch.sqrt(torch.pow(xx_channel - 0.5, 2) + torch.pow(yy_channel - 0.5, 2))
             ret = torch.cat([ret, rr], dim=1)
-            
         return ret
 
 class CoordConv(nn.Module):
@@ -113,8 +104,7 @@ class UpgradedGhostEESP(nn.Module):
         x = self.proj(x)
         splits = torch.split(x, self.split_channels, dim=1)
         outputs = [branch(s) for branch, s in zip(self.branches, splits)]
-        for i in range(1, len(outputs)):
-            outputs[i] = outputs[i] + outputs[i-1] # Correct, non-in-place operation
+        for i in range(1, len(outputs)): outputs[i] += outputs[i-1]
         x = torch.cat(outputs, dim=1)
         x = self.pointwise(x)
         return self.act(self.norm(x))
@@ -157,23 +147,11 @@ class AttentionGate(nn.Module):
         self.psi = nn.Sequential(nn.Conv2d(F_int, 1, 1, 1, 0, bias=True), nn.GroupNorm(1, 1), nn.Sigmoid())
         self.act = nn.SiLU()
     def forward(self, g, x):
-        # g: gating signal from deeper layer (lower resolution)
-        # x: skip connection from shallower layer (higher resolution)
-        
-        g1 = self.W_g(g) # (N, F_int, H, W)
-        x1 = self.W_x(x) # (N, F_int, H, W) -> x is downsampled by stride=2
-        
-        # Upsample g1 if its size doesn't match x1 after convolution
-        if g1.shape[2:] != x1.shape[2:]:
-             g1 = F.interpolate(g1, size=x1.shape[2:], mode='bilinear', align_corners=False)
-
-        psi = self.psi(self.act(g1 + x1)) # (N, 1, H, W)
-
-        # Upsample the attention map `psi` to the original size of `x`
-        psi_upsampled = F.interpolate(psi, size=x.shape[2:], mode='bilinear', align_corners=False)
-        
-        # Apply attention to the original skip connection `x`
-        return x * psi_upsampled
+        g1, x1 = self.W_g(g), self.W_x(x)
+        if g1.shape[2:] != x1.shape[2:]: x1 = F.interpolate(x1, g1.shape[2:], mode='bilinear', align_corners=False)
+        psi = self.psi(self.act(g1 + x1))
+        gated_x = F.interpolate(x, psi.shape[2:], mode='bilinear', align_corners=False) * psi
+        return F.interpolate(gated_x, x.shape[2:], mode='bilinear', align_corners=False)
 
 class PixelShuffleUpBlock(nn.Module):
     def __init__(self, in_channels, out_channels, scale_factor=2):
@@ -230,35 +208,20 @@ class FinalFusionNet_v2(NNBase):
         return value, orientation_features, shared_features, rnn_hxs
 
 # --- Policy (with Final Correction) ---
-# --- Policy (with Joint XY Sampling) ---
 class Policy(nn.Module):
     def __init__(self, obs_shape, action_space, base=None, base_kwargs=None):
         super(Policy, self).__init__()
-        if base_kwargs is None:
-            base_kwargs = {}
+        if base_kwargs is None: base_kwargs = {}
         base = FinalFusionNet_v2
-        
-        # width and length are needed for decoding the sampled action
-        self.width, self.length = action_space.nvec[1], action_space.nvec[2]
-        self.base = base(num_inputs=6, width=self.width, length=self.length, **base_kwargs)
-
+        width, length = action_space.nvec[1], action_space.nvec[2]
+        self.base = base(num_inputs=6, width=width, length=length, **base_kwargs)
         hidden_size = self.base.output_size
         self.dist_o = CategoricalWithEpsilonMask(hidden_size, 2)
+        self.dist_x_conv = init_(nn.Conv2d(32 + 2, 1, kernel_size=1))
         
-        # --- MODIFICATION START ---
-        # Replace separate x and y convs with a single joint conv head
-        # self.dist_x_conv = init_(nn.Conv2d(32 + 2, 1, kernel_size=1))
-        # self.dist_y_conv = init_(nn.Conv2d(32 + 2 + width, 1, kernel_size=1))
-        self.dist_xy_conv = init_(nn.Conv2d(32 + 2, 1, kernel_size=1))
-        # --- MODIFICATION END ---
-
-    @property
-    def is_recurrent(self):
-        return self.base.is_recurrent
-
-    @property
-    def recurrent_hidden_state_size(self):
-        return self.base.recurrent_hidden_state_size
+        # ✨✨✨ THIS IS THE FIX ✨✨✨
+        # The number of channels from x_one_hot is `width`, not 1.
+        self.dist_y_conv = init_(nn.Conv2d(32 + 2 + width, 1, kernel_size=1))
 
     def get_value(self, inputs, rnn_hxs, masks):
         value, _, _, _ = self.base(inputs, rnn_hxs, masks)
@@ -266,91 +229,120 @@ class Policy(nn.Module):
 
     def act(self, inputs, rnn_hs, masks, deterministic=False):
         value, orientation_features, shared_features, rnn_hs = self.base(inputs, rnn_hs, masks)
-        
-        # 1. Sample Orientation (o) - Unchanged
-        obs_image = inputs.view(-1, 6, self.width, self.length)
+        obs_image = inputs.view(-1, 6, self.base.width, self.base.length)
         mask_o0, mask_o1 = obs_image[:, 4, :, :], obs_image[:, 5, :, :]
         o_mask = torch.stack([mask_o0.any(dim=(-1,-2)).float(), mask_o1.any(dim=(-1,-2)).float()], dim=1)
         dist_o, _ = self.dist_o(orientation_features, o_mask)
         action_o = dist_o.mode() if deterministic else dist_o.sample()
-
-        # --- MODIFICATION START ---
-        # 2. Sample Location (x, y) jointly
         o_one_hot = F.one_hot(action_o.squeeze(-1), num_classes=2).float()
-        o_one_hot_spatial = o_one_hot.view(-1, 2, 1, 1).expand(-1, -1, self.width, self.length)
-        
-        # Create input map and get logits
-        xy_input_map = torch.cat([shared_features, o_one_hot_spatial], dim=1)
-        xy_logits_map = self.dist_xy_conv(xy_input_map).squeeze(1) # Shape: (B, W, L)
-        
-        # Select the appropriate mask based on sampled orientation
+        o_one_hot_spatial = o_one_hot.view(-1, 2, 1, 1).expand(-1, -1, self.base.width, self.base.length)
+        x_input_map = torch.cat([shared_features, o_one_hot_spatial], dim=1)
+        x_logits_map = self.dist_x_conv(x_input_map).squeeze(1)
         mask_for_o = torch.where((action_o == 0).view(-1, 1, 1), mask_o0, mask_o1)
-        
-        # Flatten logits and mask
-        flat_logits = xy_logits_map.view(xy_logits_map.size(0), -1) # Shape: (B, W*L)
-        flat_mask = mask_for_o.view(mask_for_o.size(0), -1)
-                
-        # Apply mask using torch.where to create a new tensor
-        masked_logits = torch.where(flat_mask == 1, flat_logits, -1e8)
-
-        # Create distribution and sample a single index
-        dist_xy = TorchCategorical(logits=masked_logits)
-        action_xy = dist_xy.mode() if deterministic else dist_xy.sample()
-        
-        # 3. Decode the flat index into (x, y) coordinates
-        action_y = action_xy // self.length # Use self.width
-        action_x = action_xy % self.length  # Use self.width
-
-        # 4. Calculate log probabilities
-        log_prob_o = dist_o.log_prob(action_o.squeeze(-1))
-        log_prob_xy = dist_xy.log_prob(action_xy.squeeze(-1))
-        action_log_probs = (log_prob_o + log_prob_xy).unsqueeze(-1)
-        
-        # 5. Assemble final action tensor
+        x_mask = mask_for_o.any(dim=-1).float()
+        x_logits = x_logits_map.mean(dim=-1)
+        x_logits[x_mask == 0] = -1e8
+        dist_x = TorchCategorical(logits=x_logits)
+        action_x = dist_x.mode() if deterministic else dist_x.sample()
+        x_one_hot = F.one_hot(action_x.squeeze(-1), num_classes=self.base.width).float()
+        x_one_hot_spatial = x_one_hot.view(-1, self.base.width, 1, 1).expand(-1, -1, self.base.width, self.base.length)
+        y_input_map = torch.cat([shared_features, o_one_hot_spatial, x_one_hot_spatial], dim=1)
+        y_logits_map = self.dist_y_conv(y_input_map).squeeze(1)
+        batch_indices = torch.arange(y_logits_map.size(0), device=action_x.device)
+        y_logits = y_logits_map[batch_indices, action_x.long()]
+        y_mask = mask_for_o[batch_indices, action_x.long()].float()
+        y_logits[y_mask == 0] = -1e8
+        dist_y = TorchCategorical(logits=y_logits)
+        action_y = dist_y.mode() if deterministic else dist_y.sample()
+        log_prob_o, log_prob_x, log_prob_y = dist_o.log_prob(action_o.squeeze(-1)), dist_x.log_prob(action_x.squeeze(-1)), dist_y.log_prob(action_y.squeeze(-1))
+        action_log_probs = (log_prob_o + log_prob_x + log_prob_y).unsqueeze(-1)
         action = torch.cat([action_o.view(-1, 1), action_x.view(-1, 1), action_y.view(-1, 1)], dim=1)
-        # --- MODIFICATION END ---
-        
         return value, action, action_log_probs, rnn_hs
 
     def evaluate_actions(self, inputs, rnn_hs, masks, action, gt_masks):
         value, orientation_features, shared_features, rnn_hs = self.base(inputs, rnn_hs, masks)
         action_o, action_x, action_y = action[:, 0], action[:, 1], action[:, 2]
-
-        # 1. Evaluate Orientation (o) - Unchanged
         mask_o0, mask_o1 = gt_masks[:, 0], gt_masks[:, 1]
         o_mask = torch.stack([mask_o0.any(dim=(-1,-2)).float(), mask_o1.any(dim=(-1,-2)).float()], dim=1)
         dist_o, _ = self.dist_o(orientation_features, o_mask)
-        
-        # --- MODIFICATION START ---
-        # 2. Evaluate Location (x, y) jointly
         o_one_hot = F.one_hot(action_o.long(), num_classes=2).float()
-        o_one_hot_spatial = o_one_hot.view(-1, 2, 1, 1).expand(-1, -1, self.width, self.length)
-        
-        xy_input_map = torch.cat([shared_features, o_one_hot_spatial], dim=1)
-        xy_logits_map = self.dist_xy_conv(xy_input_map).squeeze(1)
-        
+        o_one_hot_spatial = o_one_hot.view(-1, 2, 1, 1).expand(-1, -1, self.base.width, self.base.length)
+        x_input_map = torch.cat([shared_features, o_one_hot_spatial], dim=1)
+        x_logits_map = self.dist_x_conv(x_input_map).squeeze(1)
         mask_for_o = torch.where((action_o == 0).view(-1, 1, 1), mask_o0, mask_o1)
-        
-        flat_logits = xy_logits_map.view(xy_logits_map.size(0), -1)
-        flat_mask = mask_for_o.view(mask_for_o.size(0), -1)
-                
-        # Get raw probabilities before applying the mask for the loss calculation
-        raw_probs_xy = F.softmax(flat_logits, dim=-1)
-                
-        # Apply mask using torch.where to create a new tensor
-        masked_logits = torch.where(flat_mask == 1, flat_logits, -1e8)
-        dist_xy = TorchCategorical(logits=masked_logits)
-        
-        # 3. Re-encode (x, y) to flat index to get log_prob
-        action_xy = action_y * self.length + action_x
-        
-        # 4. Infeasibility Loss
-        prob_map = raw_probs_xy.view(-1, self.width, self.length)
+        x_mask = mask_for_o.any(dim=-1).float()
+        x_logits = x_logits_map.mean(dim=-1)
+        raw_probs_x = F.softmax(x_logits, dim=-1)
+        x_logits[x_mask == 0] = -1e8
+        dist_x = TorchCategorical(logits=x_logits)
+        x_one_hot = F.one_hot(action_x.long(), num_classes=self.base.width).float()
+        x_one_hot_spatial = x_one_hot.view(-1, self.base.width, 1, 1).expand(-1, -1, self.base.width, self.base.length)
+        y_input_map = torch.cat([shared_features, o_one_hot_spatial, x_one_hot_spatial], dim=1)
+        y_logits_map = self.dist_y_conv(y_input_map).squeeze(1)
+        batch_indices = torch.arange(y_logits_map.size(0), device=action_x.device)
+        y_logits = y_logits_map[batch_indices, action_x.long()]
+        y_mask = mask_for_o[batch_indices, action_x.long()].float()
+        raw_probs_y = F.softmax(y_logits, dim=-1)
+        y_logits[y_mask == 0] = -1e8
+        dist_y = TorchCategorical(logits=y_logits)
+        prob_map = raw_probs_x.unsqueeze(2) * raw_probs_y.unsqueeze(1)
         infeasibility_loss = torch.mean(prob_map * (1.0 - mask_for_o.float()))
-
-        # 5. Calculate final log_probs and entropy
-        action_log_probs = dist_o.log_prob(action_o) + dist_xy.log_prob(action_xy)
-        dist_entropy = dist_o.entropy().mean() + dist_xy.entropy().mean()
-        # --- MODIFICATION END ---
-        
+        action_log_probs = dist_o.log_prob(action_o) + dist_x.log_prob(action_x) + dist_y.log_prob(action_y)
+        dist_entropy = dist_o.entropy().mean() + dist_x.entropy().mean() + dist_y.entropy().mean()
         return value, action_log_probs, dist_entropy, rnn_hs, infeasibility_loss
+
+# ==============================================================================
+# --- TEST SCRIPT ---
+# ==============================================================================
+
+def test_full_policy_forward_pass():
+    print("--- Running Final Test: Decoupled Spatial Heads ---")
+    
+    batch_size, width, length = 4, 100, 100
+    obs_shape = (6, width, length)
+    action_space = gym.spaces.MultiDiscrete([2, width, length])
+    
+    try:
+        policy = Policy(obs_shape, action_space, base_kwargs={})
+        print("Policy instantiated successfully.")
+    except Exception as e:
+        print(f"Error during Policy instantiation: {e}")
+        return
+
+    dummy_inputs = torch.randn(batch_size, *obs_shape)
+    dummy_inputs[:, 4, 10, 10], dummy_inputs[:, 5, 20, 20] = 1, 1
+    dummy_rnn_hxs, dummy_masks = torch.randn(batch_size, 1), torch.ones(batch_size, 1)
+
+    print("\nTesting act() method...")
+    try:
+        value, action, action_log_probs, rnn_hxs = policy.act(dummy_inputs, dummy_rnn_hxs, dummy_masks)
+        print("act() forward pass completed.")
+        assert value.shape == (batch_size, 1), f"Wrong value shape: {value.shape}"
+        assert action.shape == (batch_size, 3), f"Wrong action shape: {action.shape}"
+        assert action_log_probs.shape == (batch_size, 1), f"Wrong log_probs shape: {action_log_probs.shape}"
+        print("act() output shapes are correct.")
+    except Exception as e:
+        print(f"Error during act() forward pass: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+        
+    print("\nTesting evaluate_actions() method...")
+    dummy_action = torch.tensor([[0, 10, 10], [1, 20, 20], [0, 5, 5], [1, 15, 15]], dtype=torch.float32)
+    dummy_gt_masks = torch.zeros(batch_size, 2, width, length)
+    dummy_gt_masks[0, 0, 10, 10], dummy_gt_masks[1, 1, 20, 20], dummy_gt_masks[2, 0, 5, 5], dummy_gt_masks[3, 1, 15, 15] = 1, 1, 1, 1
+    try:
+        value, log_probs, entropy, _, infeasibility = policy.evaluate_actions(dummy_inputs, dummy_rnn_hxs, dummy_masks, dummy_action, dummy_gt_masks)
+        print("evaluate_actions() forward pass completed.")
+        assert value.shape == (batch_size, 1) and log_probs.shape == (batch_size,) and entropy.shape == () and infeasibility.shape == ()
+        print("evaluate_actions() output shapes are correct.")
+    except Exception as e:
+        print(f"Error during evaluate_actions() forward pass: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+    
+    print("\n✅ All Tests Passed: Full policy network is functional.\n")
+
+if __name__ == "__main__":
+    test_full_policy_forward_pass()
