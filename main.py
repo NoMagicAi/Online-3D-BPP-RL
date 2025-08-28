@@ -5,6 +5,7 @@ import argparse
 from collections import deque
 import numpy as np
 import torch
+import csv
 from shutil import copyfile
 
 import envs  # Import to register the environment
@@ -15,7 +16,7 @@ from acktr.model import Policy
 from acktr.storage import RolloutStorage
 from tensorboardX import SummaryWriter
 from gym.envs.registration import register
-from clearml import Task
+#from clearml import Task
 
 
 # --- ADDED: Helper function to clean the model's state_dict ---
@@ -73,12 +74,14 @@ def main(args):
 
 def train_model(args):
     custom = "training-at-grace-robot"
+    '''
     task = Task.init(
         project_name=f'ACKTR/{args.env_name}',
         task_name=custom,
         output_uri=True
     )
     task.connect(args)
+    '''
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -178,6 +181,23 @@ def train_model(args):
             print(f"⚠️ Warning: Checkpoint file '{load_path}' not found. Starting from scratch.")
     # ---
 
+    # --- ADDED: CSV Logging Setup ---
+    log_file_path = os.path.join(data_path, "training_log.csv")
+    log_file_exists = os.path.isfile(log_file_path)
+
+    log_file = open(log_file_path, 'a', newline='')
+    csv_writer = csv.writer(log_file)
+
+    # Write header only if the file is new
+    if not log_file_exists:
+        header = [
+            'update_step', 'total_timesteps', 'mean_reward', 'median_reward', 
+            'mean_space_ratio', 'mean_items_packed', 'entropy_loss', 
+            'value_loss', 'action_loss', 'infeasibility_loss'
+        ]
+        csv_writer.writerow(header)
+    # --- END OF ADDED CODE ---
+
     start = time.time()
     while True:
         j += 1
@@ -253,7 +273,7 @@ def train_model(args):
                     save_file_path,
                 )
 
-                task.upload_artifact(name='best_model', artifact_object=save_file_path)
+                #task.upload_artifact(name='best_model', artifact_object=save_file_path)
 
             if writer:
                 writer.add_scalar("rewards/mean_episode_reward", np.mean(episode_rewards_summary), j)
@@ -265,6 +285,17 @@ def train_model(args):
                 writer.add_scalar("losses/infeasibility_loss", infeasibility_loss, j)
                 writer.add_scalar("popart/mean", popart_mean, j)
                 writer.add_scalar("popart/std", popart_std, j)
+            
+            # --- ADDED: Write metrics to CSV file ---
+            log_data = [
+                j, total_num_steps, np.mean(episode_rewards_summary), 
+                np.median(episode_rewards_summary), current_mean_ratio, 
+                np.mean(episode_items_summary), dist_entropy, value_loss,
+                action_loss, infeasibility_loss
+            ]
+            csv_writer.writerow(log_data)
+            log_file.flush() # Ensure data is written to disk immediately
+            # --- END OF ADDED CODE ---
 
 
 def registration_envs():

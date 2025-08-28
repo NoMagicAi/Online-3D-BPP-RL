@@ -18,6 +18,7 @@ class Flatten(nn.Module):
 # --- Base Class and Helper Module Definitions ---
 #==============================================================================
 
+
 class CategoricalWithEpsilonMask(nn.Module):
     """
     A distribution that applies a soft mask with a small epsilon value
@@ -105,6 +106,71 @@ class NNBase(nn.Module):
     def output_size(self):
         return self._hidden_size
 
+class SimpleCNNBase(NNBase):
+    """
+    A simplified CNN base network inspired by the paper's description of a
+    "State CNN 5 layers LeakyReLU".
+
+    This replaces the much deeper FinalFusionNet_v2 to serve as a more stable
+    baseline, addressing potential issues of over-complexity and vanishing
+    gradients in the RL setting.
+    """
+    def __init__(self, num_inputs, recurrent=False, hidden_size=512, width=100, length=100):
+        super(SimpleCNNBase, self).__init__(recurrent, num_inputs, hidden_size)
+
+        self.width = width
+        self.length = length
+
+        # --- Simplified 5-Layer CNN Feature Extractor ---
+        self.cnn_base = nn.Sequential(
+            init_(nn.Conv2d(num_inputs, 32, kernel_size=3, stride=1, padding=1)),
+            nn.LeakyReLU(),
+            init_(nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)), # Downsample 100->50
+            nn.LeakyReLU(),
+            init_(nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)), # Downsample 50->25
+            nn.LeakyReLU(),
+            init_(nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1)), # Downsample 25->13
+            nn.LeakyReLU(),
+            init_(nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1)),
+            nn.LeakyReLU()
+        )
+
+        # --- Heads (structure kept for API compatibility) ---
+        POOL_OUTPUT_SIZE = 4
+        head_in_features = 256 * POOL_OUTPUT_SIZE * POOL_OUTPUT_SIZE
+
+        # Actor head to generate features for the policy
+        self.actor_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d((POOL_OUTPUT_SIZE, POOL_OUTPUT_SIZE)),
+            Flatten(),
+            init_(nn.Linear(head_in_features, hidden_size)),
+            nn.LeakyReLU()
+        )
+
+        # Critic head to predict the state value - RENAMED
+        self.critic_head_decoupled = nn.Sequential(
+            nn.AdaptiveAvgPool2d((POOL_OUTPUT_SIZE, POOL_OUTPUT_SIZE)),
+            Flatten(),
+            init_(nn.Linear(head_in_features, hidden_size)),
+            nn.LeakyReLU(),
+            init_(nn.Linear(hidden_size, 1))
+        )
+
+        self.train()
+
+    def forward(self, inputs, rnn_hxs, masks):
+        x = inputs.view(-1, 6, self.width, self.length)
+
+        # 1. Extract features with the simpler 5-layer CNN
+        features = self.cnn_base(x)
+
+        # 2. Compute value and actor features from the common base - UPDATED
+        value = self.critic_head_decoupled(features)
+        actor_features = self.actor_head(features)
+
+        # 3. Return in the same format as the original class
+        return value, actor_features, rnn_hxs
+
 class SeparableConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, bias=False):
         super(SeparableConv2d, self).__init__()
@@ -148,7 +214,7 @@ class AddCoords(nn.Module):
         yy_channel = (yy_channel.repeat(b, 1, w, 1).permute(0, 1, 3, 2) / (h - 1)) * 2 - 1
         ret = torch.cat([x, xx_channel, yy_channel], dim=1)
         if self.with_r:
-            rr = torch.sqrt(torch.pow(xx_channel - 0.5, 2) + torch.pow(yy_channel - 0.5, 2))
+            rr = torch.sqrt(torch.pow(xx_channel, 2) + torch.pow(yy_channel, 2))
             ret = torch.cat([ret, rr], dim=1)
         return ret
 
@@ -358,7 +424,7 @@ class Policy(nn.Module):
             base_kwargs = {}
 
         # Use the NEW Upgraded FinalFusionNet_v2 as the base
-        base = FinalFusionNet_v2
+        base = SimpleCNNBase
 
         width = action_space.nvec[1]
         length = action_space.nvec[2]
