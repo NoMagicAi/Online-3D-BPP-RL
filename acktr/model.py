@@ -45,6 +45,7 @@ class CategoricalWithEpsilonMask(nn.Module):
         
         # If no mask is provided, still return both for a consistent signature
         return TorchCategorical(logits=logits), raw_probs
+
 class GhostModule(nn.Module):
     """
     Ghost Module for efficient feature map generation.
@@ -148,7 +149,7 @@ class AddCoords(nn.Module):
         yy_channel = (yy_channel.repeat(b, 1, w, 1).permute(0, 1, 3, 2) / (h - 1)) * 2 - 1
         ret = torch.cat([x, xx_channel, yy_channel], dim=1)
         if self.with_r:
-            rr = torch.sqrt(torch.pow(xx_channel - 0.5, 2) + torch.pow(yy_channel - 0.5, 2))
+            rr = torch.sqrt(torch.pow(xx_channel - 0.0, 2) + torch.pow(yy_channel - 0.0, 2))
             ret = torch.cat([ret, rr], dim=1)
         return ret
 
@@ -251,25 +252,14 @@ class ResidualCoordAttnBlock(nn.Module):
         return x + res
 
 #==============================================================================
-# --- REMOVED DECODER BLOCKS ---
-# The AttentionGate, PixelShuffleUpBlock, and UpgradedGhostUpEESP classes
-# are no longer needed as the decoder path has been removed.
-#==============================================================================
-
-#==============================================================================
 # --- Main Upgraded Network ---
 #==============================================================================
 
 class FinalFusionNet_v2(NNBase):
     """
-    A refactored version of FinalFusionNet that removes the decoder U-Net path
-    and adds more capacity to the encoder before the bottleneck.
-    
-    Key Changes:
-    1. Deeper Encoder: An additional downsampling layer is added.
-    2. No Decoder: The upsampling path and skip connections are removed.
-    3. Actor/Critic on Bottleneck: Both heads operate directly on the final 
-       bottleneck features, as intended.
+    An "attention-heavy" 4-layer architecture. This model prioritizes
+    computational intelligence over brute-force depth by interleaving
+    attention blocks throughout the encoder.
     """
     def __init__(self, num_inputs, recurrent=False, hidden_size=512, width=100, length=100):
         super(FinalFusionNet_v2, self).__init__(recurrent, num_inputs, hidden_size)
@@ -277,35 +267,42 @@ class FinalFusionNet_v2(NNBase):
         self.width = width
         self.length = length
 
-        # --- Encoder Path (Deeper) ---
+        # --- Encoder Path with Interleaved Attention ---
         self.level1_down = nn.Sequential(
             CoordConv(num_inputs, 32, kernel_size=3, padding=1),
             nn.GroupNorm(num_groups=8, num_channels=32),
             nn.SiLU(),
             UpgradedGhostEESP(32, 32, stride=2)
         )
+        # ADDED: Attention block for level 1
+        #self.attn1 = ResidualCoordAttnBlock(32)
+
         self.level2_down = UpgradedGhostEESP(32, 64, stride=2)
+        # ADDED: Attention block for level 2
+        #self.attn2 = ResidualCoordAttnBlock(64)
+
         self.level3_down = UpgradedGhostEESP(64, 128, stride=2)
-        # ADDED: A new layer to add more capacity before the bottleneck.
+        # ADDED: Attention block for level 3
+        self.attn3 = ResidualCoordAttnBlock(128)
+
         self.level4_down = UpgradedGhostEESP(128, 256, stride=2)
+        # ADDED: Attention block for level 4
+        self.attn4 = ResidualCoordAttnBlock(256)
 
-        # --- Bottleneck (Updated for new depth) ---
+        # REMOVED: level5_down has been removed.
+
+        # CHANGED: Bottleneck now operates on the 256-channel output from the final attention block.
         self.bottleneck = UpgradedGhostEESP(256, 256, stride=1)
-        self.attn = ResidualCoordAttnBlock(256)
 
-        # REMOVED: All decoder path layers (level3_up, level2_up, final_upsample, output_conv)
-        # have been deleted.
-
-        # --- Heads (Updated for new bottleneck feature size) ---
+        # --- Heads (Reverted to 256-channel input) ---
         POOL_OUTPUT_SIZE = 4
-        # NOTE: The input to the critic's linear layer is now 256 * 4 * 4
+        # CHANGED: Reverted to 256 channels for the linear layer input size.
         critic_linear_in_features = 256 * POOL_OUTPUT_SIZE * POOL_OUTPUT_SIZE
-        # NOTE: The actor head first reduces channels from 256 to 128 before pooling.
         actor_conv_out_channels = 128 
         actor_linear_in_features = actor_conv_out_channels * POOL_OUTPUT_SIZE * POOL_OUTPUT_SIZE
         
         self.orientation_head = nn.Sequential(
-            # CHANGED: Input channels from 128 to 256. Output is 128.
+            # CHANGED: Reverted input channels to 256.
             init_(SeparableConv2d(256, actor_conv_out_channels, kernel_size=1)),
             nn.GroupNorm(num_groups=8, num_channels=actor_conv_out_channels),
             nn.SiLU(inplace=False),
@@ -319,10 +316,10 @@ class FinalFusionNet_v2(NNBase):
         self.critic_head_decoupled = nn.Sequential(
             nn.AdaptiveAvgPool2d((POOL_OUTPUT_SIZE, POOL_OUTPUT_SIZE)),
             Flatten(),
-            # CHANGED: Input features to the linear layer updated for 256 channels.
+            # CHANGED: Reverted input features to the linear layer.
             init_(nn.Linear(critic_linear_in_features, hidden_size)),
             nn.SiLU(),
-            init_(nn.Linear(hidden_size, 1)) # Final output is a single scalar
+            init_(nn.Linear(hidden_size, 1))
         )
 
         self.train()
@@ -330,25 +327,25 @@ class FinalFusionNet_v2(NNBase):
     def forward(self, inputs, rnn_hxs, masks):
         x = inputs.view(-1, 6, self.width, self.length)
 
-        # --- Encoder ---
+        # --- Encoder with Interleaved Attention---
         l1_out = self.level1_down(x)
+        #l1_attended = self.attn1(l1_out)
+
         l2_out = self.level2_down(l1_out)
+        #l2_attended = self.attn2(l2_out)
+
         l3_out = self.level3_down(l2_out)
-        # ADDED: Forward pass through the new deeper layer.
-        encoded = self.level4_down(l3_out)
+        l3_attended = self.attn3(l3_out)
 
-        # --- Bottleneck ---
-        bottleneck_out = self.bottleneck(encoded)
-        bottleneck_out = self.attn(bottleneck_out)
+        l4_out = self.level4_down(l3_attended)
+        l4_attended = self.attn4(l4_out)
 
+        bottleneck_out = self.bottleneck(l4_attended)
+        
         # --- Heads ---
-        # Critic and Actor both operate on the final bottleneck features.
         value = self.critic_head_decoupled(bottleneck_out)
         orientation_features = self.orientation_head(bottleneck_out)
-
-        # REMOVED: The entire decoder forward pass has been removed.
         
-        # CHANGED: Return signature no longer includes `shared_features`.
         return value, orientation_features, rnn_hxs
 
 class Policy(nn.Module):
@@ -383,12 +380,10 @@ class Policy(nn.Module):
         raise NotImplementedError
 
     def get_value(self, inputs, rnn_hxs, masks):
-        # CHANGED: Unpacking updated for the new return signature from self.base.
         value, _, _ = self.base(inputs, rnn_hxs, masks)
         return value
 
     def act(self, inputs, rnn_hs, masks, deterministic=False):
-            # CHANGED: Unpacking updated for the new return signature. `shared_features` is removed.
             value, orientation_features, rnn_hs = self.base(inputs, rnn_hs, masks)
             
             obs_image = inputs.view(-1, 6, self.base.width, self.base.length)
@@ -427,7 +422,6 @@ class Policy(nn.Module):
             return value, action, action_log_probs, rnn_hs
 
     def evaluate_actions(self, inputs, rnn_hs, masks, action, gt_masks):
-            # CHANGED: Unpacking updated for the new return signature. `shared_features` is removed.
             value, orientation_features, rnn_hs = self.base(inputs, rnn_hs, masks)
             
             action_o, action_x, action_y = action[:, 0], action[:, 1], action[:, 2]

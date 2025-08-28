@@ -15,7 +15,7 @@ from acktr.model import Policy
 from acktr.storage import RolloutStorage
 from tensorboardX import SummaryWriter
 from gym.envs.registration import register
-from clearml import Task
+#from clearml import Task
 
 
 # --- ADDED: Helper function to clean the model's state_dict ---
@@ -73,12 +73,12 @@ def main(args):
 
 def train_model(args):
     custom = "training-at-grace-robot"
-    task = Task.init(
+    '''task = Task.init(
         project_name=f'ACKTR/{args.env_name}',
         task_name=custom,
         output_uri=True
     )
-    task.connect(args)
+    task.connect(args)'''
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -253,7 +253,7 @@ def train_model(args):
                     save_file_path,
                 )
 
-                task.upload_artifact(name='best_model', artifact_object=save_file_path)
+                #task.upload_artifact(name='best_model', artifact_object=save_file_path)
 
             if writer:
                 writer.add_scalar("rewards/mean_episode_reward", np.mean(episode_rewards_summary), j)

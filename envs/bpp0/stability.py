@@ -36,107 +36,35 @@ class Box:
         self.supported_by = []
         self.supports = []
 
-        # --- ADD THESE TWO LINES ---
-        self.cached_stack_mass = self.mass
-        self.cached_stack_com = self.centroid
-        # ---------------------------
-
 class StackingTree:
     """Manages the box state and performs physically correct, stateless stability analysis."""
     def __init__(self):
         self.boxes = []
         self.box_id_counter = 0
 
-    def _calculate_stack_properties_recursively(self, box, memo, all_boxes_map):
-        """
-        Calculates stack properties recursively. Used ONLY for hypothetical
-        checks inside is_placement_stable where caches are not available.
-        """
-        if box.id in memo:
-            return memo[box.id]
-
-        total_mass = box.mass
-        weighted_com = box.mass * box.centroid
-
-        # The 'supports' attribute on the real objects is correct.
-        # This check works on the temporary copied objects.
-        for box_on_top in box.supports:
-            mass_above, com_above = self._calculate_stack_properties_recursively(
-                box_on_top, memo, all_boxes_map
-            )
-            total_mass += mass_above
-            weighted_com += mass_above * com_above
-
-        if abs(total_mass) < 1e-9:
-            combined_com = box.centroid
-        else:
-            combined_com = weighted_com / total_mass
-
-        memo[box.id] = (total_mass, combined_com)
-        return total_mass, combined_com
-
-    # Change the signature to accept box_id_map
-    def add_box_permanently(self, final_box, box_id_map):
+    def add_box_permanently(self, final_box):
         """Adds a box to the scene, establishing its support relationships."""
         if final_box.id is None:
             self.box_id_counter += 1
             final_box.id = self.box_id_counter
-        
-        # Create the map needed for the new get_supporters
-        packed_boxes_map = {b.id: b for b in self.boxes}
-        # Update the call to get_supporters
-        supporters = self.get_supporters(final_box, packed_boxes_map, box_id_map)
-        
+
+        supporters = self.get_supporters(final_box, self.boxes)
         final_box.supported_by = supporters
         for s_box in supporters:
             s_box.supports.append(final_box)
 
         self.boxes.append(final_box)
 
-        # --- REPLACE THE PREVIOUS WHILE LOOP WITH THIS CORRECTED VERSION ---
-        # Propagate the mass and CoM changes up the support tree.
-        update_queue = [final_box]
-        
-        # Use a set to queue up parents to avoid redundant recalculations in a single update pass
-        parents_to_update = set()
-        for supporter in final_box.supported_by:
-            parents_to_update.add(supporter)
-            
-        while parents_to_update:
-            parent_box = parents_to_update.pop()
-
-            # Recalculate the parent's stack properties from scratch
-            new_mass = parent_box.mass
-            new_weighted_com = parent_box.centroid * parent_box.mass
-
-            for supported_box in parent_box.supports:
-                new_mass += supported_box.cached_stack_mass
-                new_weighted_com += supported_box.cached_stack_com * supported_box.cached_stack_mass
-            
-            # Update the parent's cached properties
-            parent_box.cached_stack_mass = new_mass
-            if new_mass > 1e-9: # Avoid division by zero
-                 parent_box.cached_stack_com = new_weighted_com / new_mass
-
-            # Add this parent's supporters to the next update wave
-            for grandparent in parent_box.supported_by:
-                parents_to_update.add(grandparent)
-        # --- END OF CORRECTED LOGIC ---
-
-
-    # --- REPLACE THE OLD get_supporters METHOD WITH THIS NEW ONE ---
-    def get_supporters(self, hypo_box, packed_boxes_map, box_id_map):
-        """
-        Finds all boxes that would directly support a hypothetical new box using
-        the pre-computed box_id_map for high performance.
-        """
-        # Find the unique, non-zero IDs of boxes under the new box's footprint
-        supporter_ids = np.unique(box_id_map[hypo_box.x : hypo_box.x + hypo_box.lx, 
-                                             hypo_box.y : hypo_box.y + hypo_box.ly])
-
-        # Return the actual Box objects using the provided map
-        return [packed_boxes_map[sid] for sid in supporter_ids if sid != 0]
-    # -----------------------------------------------------------------
+    def get_supporters(self, hypo_box, packed_boxes):
+        """Finds all boxes that would directly support a hypothetical new box."""
+        supporters = []
+        for packed_box in packed_boxes:
+            is_at_correct_height = abs((packed_box.z + packed_box.lz) - hypo_box.z) < 1e-5
+            if not is_at_correct_height: continue
+            x_overlaps = (hypo_box.x < packed_box.x + packed_box.lx and hypo_box.x + hypo_box.lx > packed_box.x)
+            y_overlaps = (hypo_box.y < packed_box.y + packed_box.ly and hypo_box.y + hypo_box.ly > packed_box.y)
+            if x_overlaps and y_overlaps: supporters.append(packed_box)
+        return supporters
 
     def _get_contact_center(self, top_box, bottom_box):
         """Calculates the center of the rectangular contact area between two boxes."""
@@ -171,16 +99,31 @@ class StackingTree:
             contact_points.extend([[x1, y1], [x1, y2], [x2, y1], [x2, y2]])
         return ConvexHull(contact_points)
 
-    # --- REPLACE THE OLD RECURSIVE METHOD WITH THIS ONE ---
-    def _get_stack_properties(self, box):
+    def _get_stack_properties(self, box, memo_properties):
         """
-        Instantly returns the pre-calculated total mass and combined CoM 
-        for the stack rooted at 'box' from its cached properties.
+        Recursively calculates the total mass and combined CoM for a stack
+        rooted at 'box'.
         """
-        return box.cached_stack_mass, box.cached_stack_com
-    # --------------------------------------------------------
+        if box.id in memo_properties:
+            return memo_properties[box.id]
 
-    def is_placement_stable(self, hypo_box, packed_boxes, box_id_map, debug=False):
+        total_mass = box.mass
+        weighted_com = box.mass * box.centroid
+
+        for box_on_top in box.supports:
+            mass_above, com_above = self._get_stack_properties(box_on_top, memo_properties)
+            total_mass += mass_above
+            weighted_com += mass_above * com_above
+
+        if abs(total_mass) < 1e-9:
+            combined_com = box.centroid
+        else:
+            combined_com = weighted_com / total_mass
+
+        memo_properties[box.id] = (total_mass, combined_com)
+        return total_mass, combined_com
+
+    def is_placement_stable(self, hypo_box, packed_boxes, debug=False):
         """
         Main entry point for checking stability.
         Set debug=True to get a detailed report.
@@ -197,10 +140,7 @@ class StackingTree:
             b.supports = [temp_box_map[s.id] for s in b.supports if s.id in temp_box_map]
 
         hypo_box_copy = copy.copy(hypo_box)
-        
-        # Update the call to get_supporters
-        supporters = self.get_supporters(hypo_box_copy, temp_box_map, box_id_map)
-        
+        supporters = self.get_supporters(hypo_box_copy, temp_boxes)
         if not supporters:
             if debug: print("DEBUG: No supporters found. Unstable.")
             return False
@@ -219,11 +159,6 @@ class StackingTree:
             print(f"Checking a total of {len(sorted_boxes)} boxes, from top to bottom.")
             print("==============================================================\n")
 
-
-        # --- ADD THIS MISSING LINE ---
-        # This map is needed for the recursive helper function below.
-        all_temp_boxes_map = {b.id: b for b in all_temp_boxes}
-        # ---------------------------
         memo_properties = {}
         for box_to_check in sorted_boxes:
             if not box_to_check.supported_by:
@@ -233,9 +168,7 @@ class StackingTree:
                     print("--------------------------------\n")
                 continue
 
-            total_mass, total_com = self._calculate_stack_properties_recursively(
-                box_to_check, memo_properties, all_temp_boxes_map
-            )
+            total_mass, total_com = self._get_stack_properties(box_to_check, memo_properties)
             
             if debug:
                 print(f"--- Checking Box ID: {box_to_check.id} ---")
