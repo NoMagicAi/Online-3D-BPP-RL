@@ -18,73 +18,108 @@ class Flatten(nn.Module):
 # --- Base Class and Helper Module Definitions ---
 #==============================================================================
 
-
+def init_(m):
+    if isinstance(m, SeparableConv2d):
+        nn.init.kaiming_normal_(m.depthwise.weight, nonlinearity='relu') # Note: SiLU behaves like ReLU for init
+        if m.depthwise.bias is not None:
+            nn.init.constant_(m.depthwise.bias, 0)
+        nn.init.kaiming_normal_(m.pointwise.weight, nonlinearity='relu')
+        if m.pointwise.bias is not None:
+            nn.init.constant_(m.pointwise.bias, 0)
+    elif isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+       nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+       if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+    elif isinstance(m, nn.Linear):
+        nn.init.orthogonal_(m.weight)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+    return m
 class CategoricalWithEpsilonMask(nn.Module):
     """
     A distribution that applies a soft mask with a small epsilon value
-    directly to the final probabilities, as described in the paper.
+    directly to the final probabilities.
+
+    This implementation maintains the original epsilon-masking logic on the
+    probability distribution while incorporating the initialization style and
+    helper methods from the reference class for improved structure.
     """
     def __init__(self, num_inputs, num_outputs, epsilon=1e-20):
+        """
+        Initializes the CategoricalWithEpsilonMask module.
+
+        Args:
+            num_inputs (int): The number of input features.
+            num_outputs (int): The number of output actions.
+            epsilon (float): A small value to assign to masked action probabilities.
+        """
         super(CategoricalWithEpsilonMask, self).__init__()
-        
+
+        # This will now call the externally-defined `init_` function
+        # that you provided to initialize the linear layer.
         self.linear = init_(nn.Linear(num_inputs, num_outputs))
         self.epsilon = epsilon
 
     def forward(self, x, mask=None):
+        """
+        Computes the policy distribution from the network inputs.
+
+        Args:
+            x (Tensor): The input tensor from the policy network.
+            mask (Tensor, optional): A binary tensor where a 0 indicates a
+                                     masked (invalid) action. Defaults to None.
+
+        Returns:
+            tuple: A tuple containing:
+                - final_dist (TorchCategorical): The final distribution after
+                  optionally applying the mask.
+                - raw_probs (Tensor): The original, unmasked probabilities,
+                  often useful for auxiliary losses or analysis.
+        """
         logits = self.linear(x)
-        # Get the initial, unmasked "raw" probability distribution
+
+        # Get the initial, unmasked "raw" probability distribution.
         raw_probs = F.softmax(logits, dim=-1)
 
-        if mask is not None:
-            probs_clone = raw_probs.clone()
-            probs_clone[mask == 0] = self.epsilon
-            renormalized_probs = probs_clone / probs_clone.sum(dim=-1, keepdim=True)
-            
-            final_dist = TorchCategorical(probs=renormalized_probs)
-            # RETURN a tuple: the final modulated distribution AND the raw probabilities
-            return final_dist, raw_probs
-        
-        # If no mask is provided, still return both for a consistent signature
-        return TorchCategorical(logits=logits), raw_probs
-class GhostModule(nn.Module):
-    """
-    Ghost Module for efficient feature map generation.
-    This module replaces a standard convolutional layer.
-    MODIFIED: Replaced BatchNorm2d with GroupNorm and ReLU with SiLU.
-    """
-    def __init__(self, in_channels, out_channels, kernel_size=1, ratio=2, dw_kernel_size=3, stride=1, relu=True):
-        super(GhostModule, self).__init__()
-        self.out_channels = out_channels
-        
-        init_channels = math.ceil(out_channels / ratio)
-        new_channels = init_channels * (ratio - 1)
+        # If no mask is provided, the final distribution is based on the original logits.
+        # We still return both the distribution and raw_probs for a consistent API.
+        if mask is None:
+            return TorchCategorical(logits=logits), raw_probs
 
-        # Using 8 groups for GroupNorm as a robust default.
-        # Ensure init_channels is divisible by num_groups, or handle appropriately.
-        num_groups_primary = 8 if init_channels > 0 and init_channels % 8 == 0 else (4 if init_channels > 0 and init_channels % 4 == 0 else (2 if init_channels > 0 and init_channels % 2 == 0 else 1))
-        num_groups_cheap = 8 if new_channels > 0 and new_channels % 8 == 0 else (4 if new_channels > 0 and new_channels % 4 == 0 else (2 if new_channels > 0 and new_channels % 2 == 0 else 1))
+        # --- Epsilon Masking Logic ---
+        # The core logic of this class is to apply a "soft" mask directly to the
+        # probabilities. This ensures masked actions have a tiny (epsilon)
+        # probability rather than being completely excluded. This differs from the
+        # common "hard mask" technique of subtracting a large number from logits.
 
+        # Clone the probabilities to avoid in-place modification of a tensor
+        # that might be used elsewhere.
+        probs_clone = raw_probs.clone()
 
-        self.primary_conv = nn.Sequential(
-            nn.Conv2d(in_channels, init_channels, kernel_size, stride, padding=kernel_size//2, bias=False),
-            nn.GroupNorm(num_groups=num_groups_primary, num_channels=init_channels),
-            nn.SiLU(inplace=True) if relu else nn.Sequential(),
-        )
+        # Apply the soft mask: set the probability of invalid actions to epsilon.
+        probs_clone[mask == 0] = self.epsilon
 
-        self.cheap_operation = nn.Sequential(
-            nn.Conv2d(init_channels, new_channels, dw_kernel_size, 1, padding=dw_kernel_size//2, groups=init_channels, bias=False),
-            nn.GroupNorm(num_groups=num_groups_cheap, num_channels=new_channels) if new_channels > 0 else nn.Sequential(),
-            nn.SiLU(inplace=True) if relu and new_channels > 0 else nn.Sequential(),
-        )
+        # Re-normalize the probabilities so they sum to 1 again.
+        renormalized_probs = probs_clone / probs_clone.sum(dim=-1, keepdim=True)
 
-    def forward(self, x):
-        x1 = self.primary_conv(x)
-        if self.cheap_operation and list(self.cheap_operation.children()): # Check if cheap_operation has layers
-            x2 = self.cheap_operation(x1)
-            out = torch.cat([x1, x2], dim=1)
-        else:
-            out = x1
-        return out[:, :self.out_channels, :, :]
+        # Create the final categorical distribution from the re-normalized probabilities.
+        final_dist = TorchCategorical(probs=renormalized_probs)
+
+        # Return a tuple: the final modulated distribution AND the raw probabilities.
+        return final_dist, raw_probs
+
+    def get_logits(self, x):
+        """
+        A helper method to get the raw logits from the linear layer, styled after
+        the `get_policy_distribution` method in the reference class.
+
+        Args:
+            x (Tensor): The input tensor.
+
+        Returns:
+            Tensor: The raw output logits from the linear layer.
+        """
+        return self.linear(x)
 
 class NNBase(nn.Module):
     def __init__(self, recurrent, recurrent_input_size, hidden_size):
@@ -111,9 +146,8 @@ class SimpleCNNBase(NNBase):
     A simplified CNN base network inspired by the paper's description of a
     "State CNN 5 layers LeakyReLU".
 
-    This replaces the much deeper FinalFusionNet_v2 to serve as a more stable
-    baseline, addressing potential issues of over-complexity and vanishing
-    gradients in the RL setting.
+    This version removes the AdaptiveAvgPool2d layer and operates directly on the
+    flattened output of the CNN feature extractor.
     """
     def __init__(self, num_inputs, recurrent=False, hidden_size=512, width=100, length=100):
         super(SimpleCNNBase, self).__init__(recurrent, num_inputs, hidden_size)
@@ -135,23 +169,34 @@ class SimpleCNNBase(NNBase):
             nn.LeakyReLU()
         )
 
-        # --- Heads (structure kept for API compatibility) ---
-        POOL_OUTPUT_SIZE = 4
-        head_in_features = 256 * POOL_OUTPUT_SIZE * POOL_OUTPUT_SIZE
+        # --- MODIFIED: Dynamically calculate the flattened feature size ---
+        # Helper function to get the output size of the conv base
+        def _get_conv_output_shape(shape):
+            with torch.no_grad():
+                dummy_input = torch.rand(1, *shape)
+                output_features = self.cnn_base(dummy_input)
+                return output_features.shape[1:] # Returns (C, H, W)
+
+        # Calculate the shape and total number of features
+        conv_out_shape = _get_conv_output_shape((num_inputs, self.width, self.length))
+        head_in_features = math.prod(conv_out_shape) # C * H * W
+
+        # --- MODIFIED: Heads now operate on the pure, flattened output ---
+        # REMOVED: `POOL_OUTPUT_SIZE` is no longer needed.
 
         # Actor head to generate features for the policy
         self.actor_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d((POOL_OUTPUT_SIZE, POOL_OUTPUT_SIZE)),
+            # REMOVED: nn.AdaptiveAvgPool2d(...)
             Flatten(),
-            init_(nn.Linear(head_in_features, hidden_size)),
+            init_(nn.Linear(head_in_features, hidden_size)), # MODIFIED: Using the new calculated size
             nn.LeakyReLU()
         )
 
-        # Critic head to predict the state value - RENAMED
+        # Critic head to predict the state value
         self.critic_head_decoupled = nn.Sequential(
-            nn.AdaptiveAvgPool2d((POOL_OUTPUT_SIZE, POOL_OUTPUT_SIZE)),
+            # REMOVED: nn.AdaptiveAvgPool2d(...)
             Flatten(),
-            init_(nn.Linear(head_in_features, hidden_size)),
+            init_(nn.Linear(head_in_features, hidden_size)), # MODIFIED: Using the new calculated size
             nn.LeakyReLU(),
             init_(nn.Linear(hidden_size, 1))
         )
@@ -164,7 +209,8 @@ class SimpleCNNBase(NNBase):
         # 1. Extract features with the simpler 5-layer CNN
         features = self.cnn_base(x)
 
-        # 2. Compute value and actor features from the common base - UPDATED
+        # 2. Compute value and actor features from the common base
+        #    (This part of the forward pass works without any changes)
         value = self.critic_head_decoupled(features)
         actor_features = self.actor_head(features)
 
@@ -183,239 +229,6 @@ class SeparableConv2d(nn.Module):
         x = self.pointwise(x)
         return x
 
-def init_(m):
-    if isinstance(m, SeparableConv2d):
-        nn.init.kaiming_normal_(m.depthwise.weight, nonlinearity='relu') # Note: SiLU behaves like ReLU for init
-        if m.depthwise.bias is not None:
-            nn.init.constant_(m.depthwise.bias, 0)
-        nn.init.kaiming_normal_(m.pointwise.weight, nonlinearity='relu')
-        if m.pointwise.bias is not None:
-            nn.init.constant_(m.pointwise.bias, 0)
-    elif isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
-       nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-       if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    elif isinstance(m, nn.Linear):
-        nn.init.orthogonal_(m.weight)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    return m
-
-class AddCoords(nn.Module):
-    def __init__(self, with_r=False):
-        super().__init__()
-        self.with_r = with_r
-
-    def forward(self, x):
-        b, _, h, w = x.size()
-        xx_channel = torch.arange(w, device=x.device).float()
-        yy_channel = torch.arange(h, device=x.device).float()
-        xx_channel = (xx_channel.repeat(b, 1, h, 1) / (w - 1)) * 2 - 1
-        yy_channel = (yy_channel.repeat(b, 1, w, 1).permute(0, 1, 3, 2) / (h - 1)) * 2 - 1
-        ret = torch.cat([x, xx_channel, yy_channel], dim=1)
-        if self.with_r:
-            rr = torch.sqrt(torch.pow(xx_channel, 2) + torch.pow(yy_channel, 2))
-            ret = torch.cat([ret, rr], dim=1)
-        return ret
-
-class CoordConv(nn.Module):
-    def __init__(self, in_channels, out_channels, with_r=False, **kwargs):
-        super().__init__()
-        self.addcoords = AddCoords(with_r=with_r)
-        coord_channels = 3 if with_r else 2
-        self.conv = init_(SeparableConv2d(in_channels + coord_channels, out_channels, **kwargs))
-
-    def forward(self, x):
-        x = self.addcoords(x)
-        x = self.conv(x)
-        return x
-        
-class UpgradedGhostEESP(nn.Module):
-    """
-    An EESP block using GhostModules, GroupNorm, and SiLU.
-    """
-    def __init__(self, in_channels, out_channels, stride=1, k=4, dilation_rates=[1, 2, 4, 8]):
-        super(UpgradedGhostEESP, self).__init__()
-        assert len(dilation_rates) == k, "Number of branches should match k"
-        self.k = k
-        self.split_channels = [out_channels // k] * k
-        self.split_channels[0] += out_channels - sum(self.split_channels)
-
-        self.proj = GhostModule(in_channels, out_channels, relu=False)
-        
-        self.branches = nn.ModuleList()
-        for i in range(k):
-            d = dilation_rates[i]
-            self.branches.append(
-                nn.Conv2d(
-                    self.split_channels[i], self.split_channels[i],
-                    kernel_size=3, stride=stride, padding=d, dilation=d,
-                    groups=self.split_channels[i], bias=False
-                )
-            )
-
-        self.pointwise = GhostModule(out_channels, out_channels, relu=False)
-        self.norm = nn.GroupNorm(num_groups=8 if out_channels % 8 == 0 else 4, num_channels=out_channels)
-        self.act = nn.SiLU(inplace=False)
-
-    def forward(self, x):
-        x = self.proj(x)
-        splits = torch.split(x, self.split_channels, dim=1)
-        outputs = []
-        for idx, branch in enumerate(self.branches):
-            out = branch(splits[idx])
-            if idx > 0:
-                out = out + outputs[idx - 1]
-            outputs.append(out)
-
-        x = torch.cat(outputs, dim=1)
-        x = self.pointwise(x)
-        x = self.norm(x)
-        return self.act(x)
-        
-class CoordAttn(nn.Module):
-    """
-    Coordinate Attention Block.
-    MODIFIED: Using GroupNorm and SiLU.
-    """
-    def __init__(self, inp, oup, reduction=32):
-        super(CoordAttn, self).__init__()
-        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
-        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
-        mip = max(8, inp // reduction)
-        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
-        self.norm1 = nn.GroupNorm(num_groups=1, num_channels=mip) # LayerNorm equivalent for channels
-        self.act = nn.SiLU()
-        self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
-        self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
-
-    def forward(self, x):
-        identity = x
-        n, c, h, w = x.size()
-        x_h = self.pool_h(x)
-        x_w = self.pool_w(x).permute(0, 1, 3, 2)
-        y = torch.cat([x_h, x_w], dim=2)
-        y = self.conv1(y)
-        y = self.norm1(y)
-        y = self.act(y)
-        x_h, x_w = torch.split(y, [h, w], dim=2)
-        x_w = x_w.permute(0, 1, 3, 2)
-        a_h = self.conv_h(x_h).sigmoid()
-        a_w = self.conv_w(x_w).sigmoid()
-        return identity * a_w * a_h
-
-class ResidualCoordAttnBlock(nn.Module):
-    """ A residual block with Coordinate Attention. """
-    def __init__(self, in_channels):
-        super().__init__()
-        self.attn = CoordAttn(in_channels, in_channels)
-        self.conv = init_(SeparableConv2d(in_channels, in_channels, kernel_size=1, stride=1))
-
-    def forward(self, x):
-        res = self.attn(x)
-        res = self.conv(res)
-        return x + res
-
-#==============================================================================
-# --- REMOVED DECODER BLOCKS ---
-# The AttentionGate, PixelShuffleUpBlock, and UpgradedGhostUpEESP classes
-# are no longer needed as the decoder path has been removed.
-#==============================================================================
-
-#==============================================================================
-# --- Main Upgraded Network ---
-#==============================================================================
-
-class FinalFusionNet_v2(NNBase):
-    """
-    A refactored version of FinalFusionNet that removes the decoder U-Net path
-    and adds more capacity to the encoder before the bottleneck.
-    
-    Key Changes:
-    1. Deeper Encoder: An additional downsampling layer is added.
-    2. No Decoder: The upsampling path and skip connections are removed.
-    3. Actor/Critic on Bottleneck: Both heads operate directly on the final 
-       bottleneck features, as intended.
-    """
-    def __init__(self, num_inputs, recurrent=False, hidden_size=512, width=100, length=100):
-        super(FinalFusionNet_v2, self).__init__(recurrent, num_inputs, hidden_size)
-
-        self.width = width
-        self.length = length
-
-        # --- Encoder Path (Deeper) ---
-        self.level1_down = nn.Sequential(
-            CoordConv(num_inputs, 32, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups=8, num_channels=32),
-            nn.SiLU(),
-            UpgradedGhostEESP(32, 32, stride=2)
-        )
-        self.level2_down = UpgradedGhostEESP(32, 64, stride=2)
-        self.level3_down = UpgradedGhostEESP(64, 128, stride=2)
-        # ADDED: A new layer to add more capacity before the bottleneck.
-        self.level4_down = UpgradedGhostEESP(128, 256, stride=2)
-
-        # --- Bottleneck (Updated for new depth) ---
-        self.bottleneck = UpgradedGhostEESP(256, 256, stride=1)
-        self.attn = ResidualCoordAttnBlock(256)
-
-        # REMOVED: All decoder path layers (level3_up, level2_up, final_upsample, output_conv)
-        # have been deleted.
-
-        # --- Heads (Updated for new bottleneck feature size) ---
-        POOL_OUTPUT_SIZE = 4
-        # NOTE: The input to the critic's linear layer is now 256 * 4 * 4
-        critic_linear_in_features = 256 * POOL_OUTPUT_SIZE * POOL_OUTPUT_SIZE
-        # NOTE: The actor head first reduces channels from 256 to 128 before pooling.
-        actor_conv_out_channels = 128 
-        actor_linear_in_features = actor_conv_out_channels * POOL_OUTPUT_SIZE * POOL_OUTPUT_SIZE
-        
-        self.orientation_head = nn.Sequential(
-            # CHANGED: Input channels from 128 to 256. Output is 128.
-            init_(SeparableConv2d(256, actor_conv_out_channels, kernel_size=1)),
-            nn.GroupNorm(num_groups=8, num_channels=actor_conv_out_channels),
-            nn.SiLU(inplace=False),
-            nn.AdaptiveAvgPool2d((POOL_OUTPUT_SIZE, POOL_OUTPUT_SIZE)),
-            Flatten(),
-            init_(nn.Linear(actor_linear_in_features, hidden_size)),
-            nn.LayerNorm(hidden_size),
-            nn.SiLU(inplace=False)
-        )
-        
-        self.critic_head_decoupled = nn.Sequential(
-            nn.AdaptiveAvgPool2d((POOL_OUTPUT_SIZE, POOL_OUTPUT_SIZE)),
-            Flatten(),
-            # CHANGED: Input features to the linear layer updated for 256 channels.
-            init_(nn.Linear(critic_linear_in_features, hidden_size)),
-            nn.SiLU(),
-            init_(nn.Linear(hidden_size, 1)) # Final output is a single scalar
-        )
-
-        self.train()
-
-    def forward(self, inputs, rnn_hxs, masks):
-        x = inputs.view(-1, 6, self.width, self.length)
-
-        # --- Encoder ---
-        l1_out = self.level1_down(x)
-        l2_out = self.level2_down(l1_out)
-        l3_out = self.level3_down(l2_out)
-        # ADDED: Forward pass through the new deeper layer.
-        encoded = self.level4_down(l3_out)
-
-        # --- Bottleneck ---
-        bottleneck_out = self.bottleneck(encoded)
-        bottleneck_out = self.attn(bottleneck_out)
-
-        # --- Heads ---
-        # Critic and Actor both operate on the final bottleneck features.
-        value = self.critic_head_decoupled(bottleneck_out)
-        orientation_features = self.orientation_head(bottleneck_out)
-
-        # REMOVED: The entire decoder forward pass has been removed.
-        
-        # CHANGED: Return signature no longer includes `shared_features`.
-        return value, orientation_features, rnn_hxs
 
 class Policy(nn.Module):
     def __init__(self, obs_shape, action_space, base=None, base_kwargs=None):
@@ -435,7 +248,7 @@ class Policy(nn.Module):
 
         self.dist_o = CategoricalWithEpsilonMask(hidden_size, 2)
         self.dist_x = CategoricalWithEpsilonMask(hidden_size + 2, width)
-        self.dist_y = CategoricalWithEpsilonMask(hidden_size + 2 + width, length)
+        self.dist_y = CategoricalWithEpsilonMask(hidden_size + width, length)
 
     @property
     def is_recurrent(self):
@@ -466,19 +279,19 @@ class Policy(nn.Module):
             dist_o, _ = self.dist_o(orientation_features, o_mask)
             action_o = dist_o.mode() if deterministic else dist_o.sample()
             
-            o_one_hot = F.one_hot(action_o.squeeze(-1), num_classes=2).float()
-            x_input = torch.cat([orientation_features, o_one_hot], dim=1)
-            condition = (action_o == 0).view(-1, 1, 1)
-            mask_for_o = torch.where(condition, mask_o0, mask_o1)
+            #o_one_hot = F.one_hot(action_o.squeeze(-1), num_classes=2).float()
+            x_input = torch.cat([orientation_features, dist_o.probs], dim=1)
+            #condition = (action_o == 0).view(-1, 1, 1)
+            mask_for_o = torch.logical_or(mask_o0, mask_o1)
             x_mask = mask_for_o.any(dim=-1).float()
 
             dist_x, _ = self.dist_x(x_input, x_mask)
             action_x = dist_x.mode() if deterministic else dist_x.sample()
             
             x_one_hot = F.one_hot(action_x.squeeze(-1), num_classes=self.base.width).float()
-            y_input = torch.cat([orientation_features, o_one_hot, x_one_hot], dim=1)
+            y_input = torch.cat([orientation_features, dist_x.probs], dim=1)
             index = action_x.unsqueeze(2).expand(-1, -1, self.base.length)
-            y_mask = torch.gather(mask_for_o, 1, index).squeeze(1).float()
+            y_mask = mask_for_o.any(dim=-2).float()
 
             dist_y, _ = self.dist_y(y_input, y_mask)
             action_y = dist_y.mode() if deterministic else dist_y.sample()
@@ -507,17 +320,17 @@ class Policy(nn.Module):
             dist_o, _ = self.dist_o(orientation_features, o_mask)
             
             o_one_hot = F.one_hot(action_o.long(), num_classes=2).float()
-            x_input = torch.cat([orientation_features, o_one_hot], dim=1)
-            condition = (action_o == 0).view(-1, 1, 1)
-            mask_for_o = torch.where(condition, mask_o0, mask_o1)
+            x_input = torch.cat([orientation_features, dist_o.probs], dim=1)
+            #condition = (action_o == 0).view(-1, 1, 1)
+            mask_for_o = torch.logical_or(mask_o0, mask_o1)
             x_mask = mask_for_o.any(dim=-1).float()
             
             dist_x, raw_probs_x = self.dist_x(x_input, x_mask)
             
             x_one_hot = F.one_hot(action_x.long(), num_classes=self.base.width).float()
-            y_input = torch.cat([orientation_features, o_one_hot, x_one_hot], dim=1)
-            batch_indices = torch.arange(mask_for_o.size(0), device=action_x.device)
-            y_mask = mask_for_o[batch_indices, action_x.long()].float()
+            y_input = torch.cat([orientation_features, dist_x.probs], dim=1)
+            #batch_indices = torch.arange(mask_for_o.size(0), device=action_x.device)
+            y_mask = mask_for_o.any(dim=-2).float()
             
             dist_y, raw_probs_y = self.dist_y(y_input, y_mask)
             

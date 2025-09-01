@@ -497,7 +497,7 @@ class ACKTR():
                 #
                 # ⚠️ IMPORTANT: This line should still point to the final value head layer.
                 # Now we know it's a 'SplitBias' wrapper.
-                value_head_wrapper = self.actor_critic.base.critic_head_decoupled[4] # <--- CONFIRM THIS IS YOUR LAYER
+                value_head_wrapper = self.actor_critic.base.critic_head_decoupled[-1] # <--- CONFIRM THIS IS YOUR LAYER
 
                 ## --- CORRECTED POP-ART MODIFICATION for K-FAC ---
                 # Access the weights from the original module inside the wrapper.
