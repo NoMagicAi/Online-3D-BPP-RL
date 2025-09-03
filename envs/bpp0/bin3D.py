@@ -1,8 +1,7 @@
-# envs/bpp0/bin3D.py
-
 import random
 import numpy as np
 import gym
+import time
 
 from .space import Space
 from .cutCreator import CuttingBoxCreator
@@ -121,25 +120,34 @@ class PackingGame(gym.Env):
 
             # --- REWARD CALCULATION FIX ---
             # Calculate the full reward based on the CURRENT state, BEFORE any changes.
-            alpha = 10.0
+            alpha = 1.0
             beta = 0.1
 
             volumetric_reward = alpha * self.get_box_ratio()
+
+            box_to_place = self.next_box
+            box_volume = box_to_place[0] * box_to_place[1] * box_to_place[2]
+            sum_before = np.sum(self.space.plain)
 
             bin_volume = self.space.width * self.space.length * self.space.height
             #v_safe = self._calculate_v_safe()  # V_safe of the current state
             #safety_reward = beta * (v_safe / bin_volume)
 
-            reward = volumetric_reward #+ safety_reward
 
             # Now, execute the action and change the state
             self.space.drop_box(self.next_box, (x_pos, y_pos), bool(orientation))
+            sum_after = np.sum(self.space.plain)
+            air_pocket_penalty = sum_after - sum_before - box_volume
+
+            reward = volumetric_reward - 1.5 * (air_pocket_penalty/bin_volume)
 
             # Advance the item queue and compute masks for the *next* state
             self.box_creator.drop_box()
             self.box_creator.generate_box_size()
+            #start_time = time.perf_counter()
             self._update_masks()
-
+            #end_time = time.perf_counter()
+            #print(f"Updating mask: {end_time - start_time} seconds")
             # Check if the new state is terminal
             done = not (self.mask_o0.any() or self.mask_o1.any())
         else:
@@ -152,26 +160,3 @@ class PackingGame(gym.Env):
             "ratio": self.space.get_ratio(),
         }
         return self.cur_observation, reward, done, info
-
-'''
-    def _calculate_v_safe(self):
-        """
-        Calculates the V_safe metric as described in the paper.
-        V_safe is the sum of available volume in all "safe loading points".
-        A loading point (r, c) is safe if the path from the entrance line (c=0) is clear.
-        """
-        v_safe = 0
-        heightmap = self.space.plain
-
-        # Iterate through each column (x-position)
-        for r in range(self.width):
-            # Iterate from the front of the bin (y=0) to the back
-            for c in range(self.length):
-                # If we hit an obstacle, no further points in this column can be "safe"
-                if heightmap[r, c] > 0:
-                    break
-                # If the path is clear, add the available volume of this column to V_safe
-                v_safe += self.space.height - heightmap[r, c]
-
-        return v_safe
-    '''
