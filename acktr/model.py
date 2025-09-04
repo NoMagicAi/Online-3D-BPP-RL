@@ -142,26 +142,40 @@ class CategoricalWithEpsilonMask(nn.Module):
     """
     A distribution that applies a soft mask with a small epsilon value
     directly to the final probabilities.
+    (Note: The corrected implementation masks logits for stability)
     """
     def __init__(self, num_inputs, num_outputs, epsilon=1e-20):
         super(CategoricalWithEpsilonMask, self).__init__()
         self.linear = init_(nn.Linear(num_inputs, num_outputs))
+        # Epsilon is kept for API compatibility but is no longer used
+        # in the numerically stable logit-masking implementation.
         self.epsilon = epsilon
 
     def forward(self, x, mask=None):
         logits = self.linear(x)
+        
+        # 1. Calculate raw_probs first to satisfy the API's return requirement.
         raw_probs = F.softmax(logits, dim=-1)
+
         if mask is None:
+            # If no mask, the distribution is based on the original logits.
             return TorchCategorical(logits=logits), raw_probs
         
-        probs_clone = raw_probs.clone()
-        probs_clone[mask == 0] = self.epsilon
-        renormalized_probs = probs_clone / probs_clone.sum(dim=-1, keepdim=True)
-        final_dist = TorchCategorical(probs=renormalized_probs)
+        # 2. Apply the mask to the logits for numerical stability.
+        # We use a large negative number to make the probability of masked actions negligible.
+        masked_logits = logits.clone() # Clone to avoid modifying the original logits
+        masked_logits[mask == 0] = -1e10
+
+        # 3. Create the final distribution from the masked logits.
+        # The softmax operation is handled efficiently and safely inside the constructor.
+        final_dist = TorchCategorical(logits=masked_logits)
+        
+        # 4. Return the final distribution and the original, unmasked probabilities.
         return final_dist, raw_probs
 
     def get_logits(self, x):
         return self.linear(x)
+
         
 #==============================================================================
 # --- Base Class Definitions ---
@@ -269,7 +283,7 @@ class Policy(nn.Module):
         hidden_size = self.base.output_size
         self.dist_o = CategoricalWithEpsilonMask(hidden_size, 2)
         self.dist_x = CategoricalWithEpsilonMask(hidden_size + 2, width)
-        self.dist_y = CategoricalWithEpsilonMask(hidden_size + width, length)
+        self.dist_y = CategoricalWithEpsilonMask(hidden_size + width + 2, length)
 
     @property
     def is_recurrent(self):
@@ -288,84 +302,73 @@ class Policy(nn.Module):
 
     def act(self, inputs, rnn_hs, masks, deterministic=False):
         value, actor_features, rnn_hs = self.base(inputs, rnn_hs, masks)
-        
-        # --- 1. Orientation (o) Head ---
+
         obs_image = inputs.view(-1, 6, self.base.width, self.base.length)
         mask_o0, mask_o1 = obs_image[:, 4, :, :], obs_image[:, 5, :, :]
-        
-        o_mask_0_valid = mask_o0.any(dim=(-1, -2)).float()
-        o_mask_1_valid = mask_o1.any(dim=(-1, -2)).float()
-        o_mask = torch.stack([o_mask_0_valid, o_mask_1_valid], dim=1)
 
-        dist_o, _ = self.dist_o(actor_features, o_mask)
+        o_mask = torch.stack([mask_o0, mask_o1], dim=1)
+        mask_o = o_mask.max(dim=-1).values.max(dim=-1).values
+
+        dist_o, _ = self.dist_o(actor_features, mask_o)
         action_o = dist_o.mode() if deterministic else dist_o.sample()
+        o_one_hot = F.one_hot(action_o.squeeze(-1), num_classes=2).float()
+
+        batch_indices = torch.arange(o_mask.size(0), device=inputs.device)
+        selected_o_mask = o_mask[batch_indices, action_o.squeeze(-1), :, :]
         
-        # --- 2. X-Coordinate Head ---
-        condition = (action_o == 0).view(-1, 1, 1)
-        selected_o_mask = torch.where(condition, mask_o0, mask_o1)
-        
-        x_mask = selected_o_mask.any(dim=-1).float()
-        
-        x_input = torch.cat([actor_features, dist_o.probs], dim=1)
+        x_mask = selected_o_mask.max(dim=-1).values
+
+        x_input = torch.cat([actor_features, o_one_hot], dim=1)
         dist_x, _ = self.dist_x(x_input, x_mask)
         action_x = dist_x.mode() if deterministic else dist_x.sample()
-        
-        # --- 3. Y-Coordinate Head ---
-        index = action_x.long().view(-1, 1, 1).expand(-1, -1, self.base.length)
-        y_mask = torch.gather(selected_o_mask, 1, index).squeeze(1).float()
-        
-        y_input = torch.cat([actor_features, dist_x.probs], dim=1)
+        x_one_hot = F.one_hot(action_x.squeeze(-1), num_classes=self.base.width).float()
+
+        y_mask = selected_o_mask[batch_indices, action_x.squeeze(-1), :]
+
+        y_input = torch.cat([actor_features, o_one_hot, x_one_hot], dim=1)
         dist_y, _ = self.dist_y(y_input, y_mask)
         action_y = dist_y.mode() if deterministic else dist_y.sample()
+
+        action_log_probs = (dist_o.log_prob(action_o.squeeze(-1)) + 
+                            dist_x.log_prob(action_x.squeeze(-1)) + 
+                            dist_y.log_prob(action_y.squeeze(-1))).unsqueeze(-1)
         
-        # --- 4. Combine Results ---
-        log_prob_o = dist_o.log_prob(action_o.squeeze(-1))
-        log_prob_x = dist_x.log_prob(action_x.squeeze(-1))
-        log_prob_y = dist_y.log_prob(action_y.squeeze(-1))
-        
-        action_log_probs = (log_prob_o + log_prob_x + log_prob_y).unsqueeze(-1)
         action = torch.cat([action_o, action_x, action_y], dim=1)
-        
+
         return value, action, action_log_probs, rnn_hs
 
     def evaluate_actions(self, inputs, rnn_hs, masks, action, gt_masks):
         value, actor_features, rnn_hs = self.base(inputs, rnn_hs, masks)
-        
-        action_o, action_x, action_y = action[:, 0], action[:, 1], action[:, 2]
-        
-        # --- 1. Orientation (o) Head Evaluation ---
-        mask_o0 = gt_masks[:, 0]
-        mask_o1 = gt_masks[:, 1]
-        
-        o_mask_0_valid = mask_o0.any(dim=(-1, -2)).float()
-        o_mask_1_valid = mask_o1.any(dim=(-1, -2)).float()
-        o_mask = torch.stack([o_mask_0_valid, o_mask_1_valid], dim=1)
-        
-        dist_o, _ = self.dist_o(actor_features, o_mask)
-        
-        # --- 2. X-Coordinate Head Evaluation ---
-        condition = (action_o == 0).view(-1, 1, 1)
-        selected_o_mask = torch.where(condition, mask_o0, mask_o1)
-        
-        x_mask = selected_o_mask.any(dim=-1).float()
-        
-        x_input = torch.cat([actor_features, dist_o.probs], dim=1)
-        dist_x, raw_probs_x = self.dist_x(x_input, x_mask)
-        
-        # --- 3. Y-Coordinate Head Evaluation ---
-        index = action_x.long().view(-1, 1, 1).expand(-1, -1, self.base.length)
-        y_mask = torch.gather(selected_o_mask, 1, index).squeeze(1).float()
 
-        y_input = torch.cat([actor_features, dist_x.probs], dim=1)
+        action_o, action_x, action_y = action[:, 0], action[:, 1], action[:, 2]
+
+        o_mask = gt_masks
+        mask_o = o_mask.max(dim=-1).values.max(dim=-1).values
+
+        dist_o, _ = self.dist_o(actor_features, mask_o)
+        o_one_hot = F.one_hot(action_o.long(), num_classes=2).float()
+
+        batch_indices = torch.arange(o_mask.size(0), device=inputs.device)
+        selected_o_mask = o_mask[batch_indices, action_o.long()]
+
+        x_mask = selected_o_mask.max(dim=-1).values
+
+        x_input = torch.cat([actor_features, o_one_hot], dim=1)
+        dist_x, raw_probs_x = self.dist_x(x_input, x_mask)
+        x_one_hot = F.one_hot(action_x.long(), num_classes=self.base.width).float()
+
+        y_mask = selected_o_mask[batch_indices, action_x.long()]
+
+        y_input = torch.cat([actor_features, o_one_hot, x_one_hot], dim=1)
         dist_y, raw_probs_y = self.dist_y(y_input, y_mask)
-        
-        # --- 4. Calculate Losses and Log Probs ---
+
         prob_map = raw_probs_x.unsqueeze(2) * raw_probs_y.unsqueeze(1)
-        mask_for_o = torch.logical_or(mask_o0, mask_o1)
-        infeasibility_mask = 1.0 - mask_for_o.float()
+        infeasibility_mask = 1.0 - selected_o_mask.float()
         infeasibility_loss = torch.mean(prob_map * infeasibility_mask)
-        
+
         action_log_probs = dist_o.log_prob(action_o) + dist_x.log_prob(action_x) + dist_y.log_prob(action_y)
+
         dist_entropy = dist_o.entropy().mean() + dist_x.entropy().mean() + dist_y.entropy().mean()
-        
-        return value, action_log_probs, dist_entropy, rnn_hs, infeasibility_loss
+
+        return value, action_log_probs.unsqueeze(-1), dist_entropy, rnn_hs, infeasibility_loss
+

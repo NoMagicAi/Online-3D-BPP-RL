@@ -177,7 +177,7 @@ class PackingGame(gym.Env):
             air_pocket_volume = sum_after - sum_before - box_volume
             
             # The final reward is the volumetric reward minus the normalized penalty
-            reward = volumetric_reward - 1.5 * (air_pocket_volume / bin_volume)
+            reward = volumetric_reward #- 1.5 * (air_pocket_volume / bin_volume)
 
             # Advance to the next box and update the state for the next step
             self.box_creator.drop_box()
