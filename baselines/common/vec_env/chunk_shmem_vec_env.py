@@ -78,7 +78,7 @@ class ChunkedShmemVecEnv(VecEnv):
         envs_per_proc (int, optional): The number of environments to run sequentially
             in each worker process. Set to 8 or 16 as requested.
     """
-    def __init__(self, env_fns, spaces=None, context='spawn', envs_per_proc=8):
+    def __init__(self, env_fns, spaces=None, context='spawn', envs_per_proc=30):
         ctx = mp.get_context(context)
         if spaces:
             observation_space, action_space = spaces
