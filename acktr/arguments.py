@@ -49,6 +49,8 @@ def get_args():
         type=int,
         default=500,
         help='Log a visual of the packing state every N updates (default: 500)')
+    parser.add_argument('--project_name', default='rl_planner', type=str, help='project name for ClearML')
+    parser.add_argument('--experiment_name', default='acktr_experiment_' + time.strftime("%Y%m%d-%H%M%S"), type=str, help='experiment name for ClearML')
     args = parser.parse_args()
 
     args.device = "cuda:" + str(args.device) if args.use_cuda and torch.cuda.is_available() else "cpu"

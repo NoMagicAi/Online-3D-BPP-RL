@@ -140,11 +140,10 @@ def log_3d_render(logger, boxes, container_size, iteration):
     plt.close(fig)
 
 def train_model(args):
-    custom = "training-at-laptop2"
     # --- MODIFIED: Activated ClearML Task ---
     task = Task.init(
-        project_name=f'ACKTR/{args.env_name}',
-        task_name=custom,
+        project_name=f'{args.project_name}',
+        task_name=args.experiment_name,
         output_uri=True
     )
     task.connect(args)
@@ -157,7 +156,7 @@ def train_model(args):
 
     save_path = args.save_dir
     if not os.path.exists(save_path): os.makedirs(save_path)
-    data_path = os.path.join(save_path, custom)
+    data_path = os.path.join(save_path, args.experiment_name)
     if not os.path.exists(data_path): os.makedirs(data_path)
 
     torch.set_num_threads(1)
@@ -198,7 +197,7 @@ def train_model(args):
 
     writer = None
     if args.tensorboard:
-        tbx_dir = os.path.join("./runs", args.env_name, custom)
+        tbx_dir = os.path.join("./runs", args.env_name, args.experiment_name)
         if not os.path.exists(tbx_dir): os.makedirs(tbx_dir)
         writer = SummaryWriter(logdir=tbx_dir)
 
