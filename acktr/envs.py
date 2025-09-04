@@ -8,6 +8,7 @@ from baselines import bench
 from baselines.common.vec_env import VecEnvWrapper
 from baselines.common.vec_env.dummy_vec_env import DummyVecEnv
 from baselines.common.vec_env.shmem_vec_env import ShmemVecEnv
+from baselines.common.vec_env.chunk_shmem_vec_env import ChunkedShmemVecEnv
 from baselines.common.vec_env.vec_normalize import \
     VecNormalize as VecNormalize_
 import sys
@@ -99,7 +100,7 @@ def make_vec_envs(env_name,
                        box_set=args.box_size_set, container_size=args.container_size, test = False,
                        data_name = None)
         spaces = [env.observation_space, env.action_space]
-        envs = ShmemVecEnv(envs, spaces, context='fork')
+        envs = ChunkedShmemVecEnv(envs, spaces, context='fork')
 
         # envs = DummyVecEnv(envs)
     else:

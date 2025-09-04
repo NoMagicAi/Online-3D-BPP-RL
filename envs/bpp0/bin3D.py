@@ -193,4 +193,14 @@ class PackingGame(gym.Env):
             "counter": len(self.space.stacking_tree.boxes),
             "ratio": self.space.get_ratio(),
         }
+
+        # --- ADDED CODE: Add final state to info dict on completion ---
+        if done:
+            # This logs the state only if the episode ended because there were no more valid moves,
+            # which indicates a successful packing attempt.
+            if not (self.mask_o0.any() or self.mask_o1.any()):
+                info['final_heightmap'] = self.space.plain
+                info['final_boxes'] = self.space.stacking_tree.boxes
+        # --- END OF ADDED CODE ---
+
         return self.cur_observation, reward, done, info

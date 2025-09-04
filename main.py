@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import csv
 from shutil import copyfile
+import colorsys
 
 import envs  # Import to register the environment
 from acktr import algo, utils
@@ -16,8 +17,10 @@ from acktr.model import Policy
 from acktr.storage import RolloutStorage
 from tensorboardX import SummaryWriter
 from gym.envs.registration import register
-#from clearml import Task
-
+# --- ADDED: Import ClearML and Matplotlib ---
+from clearml import Task
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
 # --- ADDED: Helper function to clean the model's state_dict ---
 def get_cleaned_state_dict(state_dict_to_clean: dict) -> dict:
@@ -71,17 +74,83 @@ def main(args):
     else:
         train_model(args)
 
+def log_final_heatmap(logger, heightmap, container_size, iteration):
+    """Logs a 2D heatmap of the final heightmap to ClearML."""
+    if heightmap is None:
+        return
+    fig, ax = plt.subplots(figsize=(8, 8))
+    im = ax.imshow(heightmap.T, cmap='viridis', origin='lower', vmin=0, vmax=container_size[2])
+    ax.set_title(f'Final Heightmap at Update {iteration}')
+    ax.set_xlabel('Container Width')
+    ax.set_ylabel('Container Length')
+    fig.colorbar(im, ax=ax, label='Packed Height')
+    logger.report_matplotlib_figure(
+        title="Final Packing State",
+        series="2D Heightmap",
+        iteration=iteration,
+        figure=fig
+    )
+    plt.close(fig)
+
+def log_3d_render(logger, boxes, container_size, iteration):
+    """Logs a 3D voxel render of the packed boxes to ClearML with distinct colors."""
+    if not boxes:
+        return
+
+    fig = plt.figure(figsize=(12, 12))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # CORRECTED LINE 1: Use the modern 'plt.colormaps.get_cmap'
+    # 1. Get the base colormap
+    base_cmap = plt.colormaps.get_cmap('tab20') 
+    # 2. Resample it to the desired number of colors
+    cmap = base_cmap.resampled(len(boxes) + 1)
+    
+    # CORRECTED LINE 2: Convert 'container_size' to a tuple before concatenation
+    facecolors_array = np.full(tuple(container_size) + (4,), [0, 0, 0, 0.0], dtype=float)
+
+    for i, box in enumerate(boxes):
+        x, y, z = int(box.x), int(box.y), int(box.z)
+        w, l, h = int(box.lx), int(box.ly), int(box.lz)
+        
+        box_color = cmap(i + 1)
+        
+        # Fill the relevant part of the facecolors_array
+        if (0 <= x < container_size[0] and 0 <= y < container_size[1] and 0 <= z < container_size[2]):
+             facecolors_array[x:x+w, y:y+l, z:z+h] = box_color
+
+    filled = np.any(facecolors_array[..., :3] != [0,0,0], axis=-1)
+    
+    ax.voxels(filled, facecolors=facecolors_array, edgecolor='k', linewidth=0.5)
+
+    ax.set_xlabel('Width')
+    ax.set_ylabel('Length')
+    ax.set_zlabel('Height')
+    ax.set_title(f'3D Render at Update {iteration}')
+    ax.set_xlim(0, container_size[0])
+    ax.set_ylim(0, container_size[1])
+    ax.set_zlim(0, container_size[2])
+    
+    logger.report_matplotlib_figure(
+        title="Final Packing State",
+        series="3D Voxel Render",
+        iteration=iteration,
+        figure=fig
+    )
+    plt.close(fig)
 
 def train_model(args):
-    custom = "training-at-grace-robot"
-    '''
+    custom = "training-at-laptop2"
+    # --- MODIFIED: Activated ClearML Task ---
     task = Task.init(
         project_name=f'ACKTR/{args.env_name}',
         task_name=custom,
         output_uri=True
     )
     task.connect(args)
-    '''
+    # --- ADDED: Get ClearML logger ---
+    logger = task.get_logger()
+
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -198,9 +267,18 @@ def train_model(args):
         csv_writer.writerow(header)
     # --- END OF ADDED CODE ---
 
+    # --- ADDED: History tracking for ClearML plots ---
+    plot_history = {
+        'updates': [], 'mean_reward': [], 'median_reward': [],
+        'mean_space_ratio': [], 'mean_items_packed': [],
+        'entropy_loss': [], 'value_loss': [], 'action_loss': [],
+        'infeasibility_loss': []
+    }
+
     start = time.time()
     while True:
         j += 1
+        logged_visual_this_step = False
         for step in range(args.num_steps):
             with torch.no_grad():
                 value, action, action_log_prob, recurrent_hidden_states = actor_critic.act(
@@ -208,6 +286,8 @@ def train_model(args):
                     rollouts.masks[step]
                 )
             obs, reward, done, infos = envs.step(action)
+            
+            
             for i, info in enumerate(infos):
                 current_episode_rewards[i] += reward[i].item()
                 if done[i]:
@@ -215,6 +295,21 @@ def train_model(args):
                     episode_ratio_summary.append(info.get("ratio", 0))
                     episode_items_summary.append(info.get("counter", 0))
                     current_episode_rewards[i] = 0
+
+                    # --- MODIFIED: Added check for the flag ---
+                    if j % args.visual_log_interval == 0 and not logged_visual_this_step:
+                        final_heightmap = info.get('final_heightmap')
+                        final_boxes = info.get('final_boxes')
+                        
+                        if final_heightmap is not None:
+                            log_final_heatmap(logger, final_heightmap, args.container_size, j)
+                        
+                        if final_boxes is not None:
+                            log_3d_render(logger, final_boxes, args.container_size, j)
+                        
+                        # --- ADDED: Set the flag to True after logging ---
+                        if final_heightmap is not None or final_boxes is not None:
+                            logged_visual_this_step = True
 
             masks = torch.FloatTensor([[0.0] if done_ else [1.0] for done_ in done])
             bad_masks = torch.FloatTensor(
@@ -273,7 +368,7 @@ def train_model(args):
                     save_file_path,
                 )
 
-                #task.upload_artifact(name='best_model', artifact_object=save_file_path)
+                task.upload_artifact(name='best_model', artifact_object=save_file_path)
 
             if writer:
                 writer.add_scalar("rewards/mean_episode_reward", np.mean(episode_rewards_summary), j)
@@ -296,6 +391,76 @@ def train_model(args):
             csv_writer.writerow(log_data)
             log_file.flush() # Ensure data is written to disk immediately
             # --- END OF ADDED CODE ---
+
+            # --- START: ADDED ClearML Plot Logging ---
+            # 1. Update history with current metrics
+            plot_history['updates'].append(j)
+            plot_history['mean_reward'].append(np.mean(episode_rewards_summary))
+            plot_history['median_reward'].append(np.median(episode_rewards_summary))
+            plot_history['mean_space_ratio'].append(current_mean_ratio)
+            plot_history['mean_items_packed'].append(np.mean(episode_items_summary))
+            plot_history['entropy_loss'].append(dist_entropy)
+            plot_history['value_loss'].append(value_loss)
+            plot_history['action_loss'].append(action_loss)
+            plot_history['infeasibility_loss'].append(infeasibility_loss)
+
+            # 2. Generate and log 'Rewards' plot
+            plt.figure(figsize=(10, 6))
+            plt.plot(plot_history['updates'], plot_history['mean_reward'], label='Mean Reward', marker='o', linestyle='-')
+            plt.plot(plot_history['updates'], plot_history['median_reward'], label='Median Reward', marker='x', linestyle='--')
+            plt.title('Episode Rewards over Time')
+            plt.xlabel('Update Step')
+            plt.ylabel('Reward')
+            plt.legend()
+            plt.grid(True)
+            logger.report_matplotlib_figure(
+                title="Episode Rewards",
+                series="Rewards Plot",
+                iteration=j,
+                figure=plt
+            )
+            plt.close()
+
+            # 3. Generate and log 'Performance Metrics' plot
+            fig, ax1 = plt.subplots(figsize=(10, 6))
+            ax1.set_xlabel('Update Step')
+            ax1.set_ylabel('Space Ratio', color='tab:blue')
+            ax1.plot(plot_history['updates'], plot_history['mean_space_ratio'], label='Mean Space Ratio', color='tab:blue', marker='o')
+            ax1.tick_params(axis='y', labelcolor='tab:blue')
+            ax2 = ax1.twinx()  # instantiate a second axes that shares the same x-axis
+            ax2.set_ylabel('Items Packed', color='tab:orange')
+            ax2.plot(plot_history['updates'], plot_history['mean_items_packed'], label='Mean Items Packed', color='tab:orange', marker='x', linestyle='--')
+            ax2.tick_params(axis='y', labelcolor='tab:orange')
+            fig.tight_layout()
+            plt.title('Performance Metrics over Time')
+            plt.grid(True)
+            logger.report_matplotlib_figure(
+                title="Performance Metrics",
+                series="Ratio and Items Plot",
+                iteration=j,
+                figure=plt
+            )
+            plt.close()
+
+            # 4. Generate and log 'Losses' plot
+            plt.figure(figsize=(10, 6))
+            plt.plot(plot_history['updates'], plot_history['entropy_loss'], label='Entropy', marker='.')
+            plt.plot(plot_history['updates'], plot_history['value_loss'], label='Value', marker='.')
+            plt.plot(plot_history['updates'], plot_history['action_loss'], label='Action', marker='.')
+            plt.plot(plot_history['updates'], plot_history['infeasibility_loss'], label='Infeasibility', marker='.')
+            plt.title('Training Losses over Time')
+            plt.xlabel('Update Step')
+            plt.ylabel('Loss')
+            plt.legend()
+            plt.grid(True)
+            logger.report_matplotlib_figure(
+                title="Training Losses",
+                series="Losses Plot",
+                iteration=j,
+                figure=plt
+            )
+            plt.close()
+            # --- END: ADDED ClearML Plot Logging ---
 
 
 def registration_envs():

@@ -44,7 +44,11 @@ def get_args():
                         help='use PopArt to normalize rewards')
     parser.add_argument('--popart-beta', type=float, default=1e-4,
                         help='beta for running mean and std in PopArt (decay factor)')
-    
+    parser.add_argument(
+        '--visual-log-interval',
+        type=int,
+        default=500,
+        help='Log a visual of the packing state every N updates (default: 500)')
     args = parser.parse_args()
 
     args.device = "cuda:" + str(args.device) if args.use_cuda and torch.cuda.is_available() else "cpu"
