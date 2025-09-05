@@ -1,11 +1,13 @@
 import time
 import math
+from xml.parsers.expat import model
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 from typing import Tuple, List
+import torch
 
 # ==============================================================================
 # Helper Modules & JIT-Compiled Functions
@@ -551,7 +553,10 @@ class ACKTR():
             #    This is the new block of code to add. 👍
             with torch.no_grad():
                 adv_mean = advantages.mean()
-                adv_std = advantages.std()
+                if advantages.numel() > 1:
+                    adv_std = advantages.std()
+                else:
+                    adv_std = 0.0
                 normalized_advantages = (advantages - adv_mean) / (adv_std + 1e-5)
 
             # 4. Use the normalized advantages (detached) for the action loss
