@@ -261,6 +261,8 @@ class SimpleCNNBase(NNBase):
     def forward(self, inputs, rnn_hxs, masks):
         x = inputs.view(-1, 6, self.width, self.length)
         features = self.cnn_base(x)
+        if torch.isnan(features).any():
+            print(features)
         value = self.critic_head_decoupled(features)
         actor_features = self.actor_head(features)
         return value, actor_features, rnn_hxs

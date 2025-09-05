@@ -19,12 +19,7 @@
             "request": "launch",
             "program": "main.py",
             "console": "integratedTerminal",
-            "args": "--container_size 4 4 4 --item-size-range 2 2 2 2 2 2 --item-seq cut1 --num_steps 128 --log_interval 5 --num_processes 1"
+            "args": "--container_size 30 30 30 --item-seq rs --num_steps 1 --log_interval 5 --item-size-range 5 5 5 5 5 5 --entropy_coef 0.04 --gae-lambda 0.0 --use-popart"
         }
     ]
 }
-
-
-
-
-

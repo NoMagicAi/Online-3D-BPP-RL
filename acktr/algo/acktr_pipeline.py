@@ -455,8 +455,12 @@ class ACKTR():
         
         mean = self.actor_critic.popart_mean
         mean_sq = self.actor_critic.popart_mean_sq
-        # Add a small epsilon for numerical stability
-        std = torch.sqrt(mean_sq - mean.pow(2)).clamp(min=1e-6)
+        # --- START MODIFICATION ---
+        # Calculate variance and ensure it's non-negative before sqrt to prevent NaN.
+        # Then, clamp the resulting std to a minimum value for numerical stability.
+        variance = mean_sq - mean.pow(2)
+        std = torch.sqrt(F.relu(variance)).clamp(min=1e-6)
+        # --- END MODIFICATION ---
         
         return value * std + mean
 
@@ -473,7 +477,11 @@ class ACKTR():
                 
                 # Get old statistics for the linear layer update
                 old_mean = self.actor_critic.popart_mean.clone()
-                old_std = torch.sqrt(self.actor_critic.popart_mean_sq - old_mean.pow(2)).clamp(min=1e-6)
+                # --- START MODIFICATION ---
+                # Calculate variance and ensure it's non-negative before sqrt to prevent NaN.
+                old_variance = self.actor_critic.popart_mean_sq - old_mean.pow(2)
+                old_std = torch.sqrt(F.relu(old_variance)).clamp(min=1e-6)
+                # --- END MODIFICATION ---
 
                 sample_obs = rollouts.obs[0] # Pick a consistent sample
                 val_before_update = self.de_normalize_value(self.actor_critic.get_value(sample_obs, rollouts.recurrent_hidden_states[0], rollouts.masks[0]))
@@ -488,7 +496,11 @@ class ACKTR():
 
                 # Get new statistics
                 new_mean = self.actor_critic.popart_mean
-                new_std = torch.sqrt(self.actor_critic.popart_mean_sq - new_mean.pow(2)).clamp(min=1e-6)
+                # --- START MODIFICATION ---
+                # Calculate variance and ensure it's non-negative before sqrt to prevent NaN.
+                new_variance = self.actor_critic.popart_mean_sq - new_mean.pow(2)
+                new_std = torch.sqrt(F.relu(new_variance)).clamp(min=1e-6)
+                # --- END MODIFICATION ---
 
                 #
                 # ⚠️ IMPORTANT: Identify the final linear layer of your value function head.
