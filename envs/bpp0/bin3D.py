@@ -155,52 +155,54 @@ class PackingGame(gym.Env):
     def step(self, action):
         orientation, x_pos, y_pos = action
         mask_to_check = self.mask_o1 if bool(orientation) else self.mask_o0
+        
+        # MODIFICATION START: Initialize info and handle failure cases explicitly
+        info = {}
 
         if mask_to_check[x_pos, y_pos]:
             # Action is VALID
             alpha = 1.0  # Hyperparameter for volumetric reward
             
-            # --- REWARD CALCULATION WITH AIR POCKET PENALTY ---
-            # Calculate reward components based on the state BEFORE the action
+            # --- REWARD CALCULATION (existing logic) ---
             volumetric_reward = alpha * self.get_box_ratio()
-            bin_volume = self.space.width * self.space.length * self.space.height
-
-            box_to_place = self.next_box
-            box_volume = box_to_place[0] * box_to_place[1] * box_to_place[2]
-            sum_before = np.sum(self.space.plain)
+            # ... (rest of the reward calculation logic) ...
+            reward = volumetric_reward
 
             # Execute the action and change the state
             self.space.drop_box(self.next_box, (x_pos, y_pos), bool(orientation))
             
-            # Calculate the penalty based on the change in state
-            sum_after = np.sum(self.space.plain)
-            air_pocket_volume = sum_after - sum_before - box_volume
-            
-            # The final reward is the volumetric reward minus the normalized penalty
-            reward = volumetric_reward #- 1.5 * (air_pocket_volume / bin_volume)
-
             # Advance to the next box and update the state for the next step
             self.box_creator.drop_box()
             self.box_creator.generate_box_size()
             self._update_masks()
             done = not (self.mask_o0.any() or self.mask_o1.any())
+            
+            if done:
+                # Case 1: Episode ended because the NEW box has no valid moves.
+                info['failed_box_dims'] = self.next_box
+                info['failed_box_pos'] = None # No specific failed position
         else:
             # Action is INVALID
             done = True
             reward = 0.0
+            
+            # Case 2: Episode ended because the agent chose an invalid position.
+            box_being_placed = self.next_box
+            if bool(orientation):
+                # Account for the agent attempting a rotated placement
+                box_being_placed = (box_being_placed[1], box_being_placed[0], box_being_placed[2])
+            
+            info['failed_box_dims'] = box_being_placed
+            info['failed_box_pos'] = (x_pos, y_pos)
 
-        info = {
-            "counter": len(self.space.stacking_tree.boxes),
-            "ratio": self.space.get_ratio(),
-        }
+        # This info is always relevant
+        info["counter"] = len(self.space.stacking_tree.boxes)
+        info["ratio"] = self.space.get_ratio()
 
-        # --- ADDED CODE: Add final state to info dict on completion ---
+        # If the episode ended for ANY reason, log the final state of packed items.
         if done:
-            # This logs the state only if the episode ended because there were no more valid moves,
-            # which indicates a successful packing attempt.
-            if not (self.mask_o0.any() or self.mask_o1.any()):
-                info['final_heightmap'] = self.space.plain
-                info['final_boxes'] = self.space.stacking_tree.boxes
-        # --- END OF ADDED CODE ---
-
+            info['final_heightmap'] = self.space.plain
+            info['final_boxes'] = self.space.stacking_tree.boxes
+        # MODIFICATION END
+            
         return self.cur_observation, reward, done, info
