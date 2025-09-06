@@ -92,6 +92,8 @@ def log_final_heatmap(logger, heightmap, container_size, iteration):
     )
     plt.close(fig)
 
+# In your main training script
+
 def log_3d_render(logger, boxes, container_size, iteration, failed_box_info=None, final_heightmap=None):
     """Logs a 3D voxel render, including a failed box if provided."""
     if not boxes and not failed_box_info:
@@ -106,7 +108,7 @@ def log_3d_render(logger, boxes, container_size, iteration, failed_box_info=None
     
     facecolors_array = np.full(tuple(container_size) + (4,), [0, 0, 0, 0.0], dtype=float)
 
-    # 1. Render successfully packed boxes (existing logic)
+    # 1. Render successfully packed boxes (no changes here)
     if boxes:
         for i, box in enumerate(boxes):
             x, y, z = int(box.x), int(box.y), int(box.z)
@@ -116,30 +118,42 @@ def log_3d_render(logger, boxes, container_size, iteration, failed_box_info=None
             if (0 <= x < container_size[0] and 0 <= y < container_size[1] and 0 <= z < container_size[2]):
                  facecolors_array[x:x+w, y:y+l, z:z+h] = box_color
 
-    # MODIFICATION START: Render the failed box in black
+    # --- MODIFICATION START: Correctly render the failed box ---
     if failed_box_info and 'dims' in failed_box_info and final_heightmap is not None:
+        # For debugging, you can uncomment the next line to see if the info arrives here
+        # print(f"DEBUG: Rendering failed box with info: {failed_box_info}")
+        
         dims = failed_box_info['dims']
         pos = failed_box_info.get('pos')
         
         w, l, h = int(dims[0]), int(dims[1]), int(dims[2])
         
+        # Determine the position of the failed attempt
         if pos is not None:
             # Invalid action at a specific (x, y)
             x, y = int(pos[0]), int(pos[1])
             footprint = final_heightmap[x:min(x + w, container_size[0]), y:min(y + l, container_size[1])]
-            z = int(np.max(footprint)) if footprint.size > 0 else 0
+            z_attempt = int(np.max(footprint)) if footprint.size > 0 else 0
         else:
-            # No valid moves left; visualize box floating above the highest point
+            # No valid moves left; place at corner on top of the highest point
             x, y = 0, 0
-            z = int(np.max(final_heightmap)) if final_heightmap.size > 0 else 0
+            z_attempt = int(np.max(final_heightmap)) if final_heightmap.size > 0 else 0
 
+        # --- THIS IS THE FIX ---
+        # Clamp the Z-position to ensure the box is drawn inside the container volume.
+        # This forces the box's top surface to be, at most, flush with the container's top.
+        z = min(z_attempt, container_size[2] - h)
+        z = max(z, 0) # Ensure z is not negative
+
+        # Clip dimensions to stay within the container for visualization
         x_end = min(x + w, container_size[0])
         y_end = min(y + l, container_size[1])
         z_end = min(z + h, container_size[2])
         
-        # Set the failed box color to semi-transparent black
-        facecolors_array[x:x_end, y:y_end, z:z_end] = [0, 0, 0, 0.8]
-    # MODIFICATION END
+        # Color the region black if it has volume
+        if x < x_end and y < y_end and z < z_end:
+            facecolors_array[x:x_end, y:y_end, z:z_end] = [0, 0, 0, 0.8] # Black, semi-transparent
+    # --- MODIFICATION END ---
 
     filled = np.any(facecolors_array[..., :3] != [0, 0, 0], axis=-1)
     ax.voxels(filled, facecolors=facecolors_array, edgecolor='k', linewidth=0.5)
