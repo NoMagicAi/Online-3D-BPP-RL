@@ -325,7 +325,6 @@ def train_model(args):
             for i, info in enumerate(infos):
                 current_episode_rewards[i] += reward[i].item()
                 if done[i]:
-                    print(f"DEBUG: Env {i} finished on update step {j}. Info keys from env: {info.keys()}")
                     episode_rewards_summary.append(current_episode_rewards[i])
                     episode_ratio_summary.append(info.get("ratio", 0))
                     episode_items_summary.append(info.get("counter", 0))
