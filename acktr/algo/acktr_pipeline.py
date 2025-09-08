@@ -171,7 +171,7 @@ class KFACOptimizer(optim.Optimizer):
     """
     K-FAC optimizer with optional low-rank approximation and Fisher update subsampling.
     """
-    def __init__(self, model, lr=0.1, momentum=0.9, stat_decay=0.99, kl_clip=0.001, 
+    def __init__(self, model, lr=0.01, momentum=0.9, stat_decay=0.99, kl_clip=0.001, 
                  damping=1e-2, weight_decay=0, fast_cnn=True, Ts=1, Tf=10, 
                  kfac_approx_rank=None, fisher_frac=1.0):
         """
@@ -401,7 +401,7 @@ class ACKTR():
                  invaild_coef,
                  acktr=False,
                  # KFAC-specific hyperparameters
-                 lr=0.01, 
+                 lr=0.001, 
                  kfac_clip=0.001,
                  kfac_damping=1e-2,
                  kfac_stat_decay=0.99,
@@ -638,7 +638,7 @@ if __name__ == '__main__':
         entropy_coef=0.01,
         invaild_coef=0.01,
         acktr=True,
-        lr=0.01,          # KFAC learning rate
+        lr=0.001,          # KFAC learning rate
         kfac_clip=0.01,   # KFAC kl_clip
         kfac_damping=0.001, # KFAC damping
         use_amp=False,      # Set to True if using a CUDA GPU
