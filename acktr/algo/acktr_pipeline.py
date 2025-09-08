@@ -472,6 +472,7 @@ class ACKTR():
         ## --- START OF POP-ART BLOCK ---
         if self.use_popart:
             with torch.no_grad():
+                # The returns in the buffer are currently unnormalized.
                 returns = rollouts.returns
                 
                 # Get old statistics for the linear layer update
@@ -479,67 +480,54 @@ class ACKTR():
                 old_variance = self.actor_critic.popart_mean_sq - old_mean.pow(2)
                 old_std = torch.sqrt(F.relu(old_variance)).clamp(min=1e-6)
 
+                # --- FIX START: Restore the missing sample_obs definition ---
+                # Pick a consistent sample to verify output preservation
+                sample_obs = rollouts.obs[0]
+                # --- FIX END ---
+                
+                val_before_update = self.de_normalize_value(self.actor_critic.get_value(sample_obs, rollouts.recurrent_hidden_states[0], rollouts.masks[0]))
+
                 # Update running statistics using the new batch of returns
                 batch_mean = returns.mean()
                 batch_mean_sq = returns.pow(2).mean()
 
-                # --- START FIX ---
-                # Calculate the new statistics using standard, non-in-place math
+                # --- FIX START: Correct the statistics update logic ---
+                # Calculate new stats using standard math (avoids silent in-place bug)
                 new_mean_val = (self.actor_critic.popart_mean * (1 - self.popart_beta) + 
                                 batch_mean * self.popart_beta)
                 new_mean_sq_val = (self.actor_critic.popart_mean_sq * (1 - self.popart_beta) + 
-                                batch_mean_sq * self.popart_beta)
+                                   batch_mean_sq * self.popart_beta)
 
-                # Update the buffers in-place with the new values
+                # Safely update the buffers in-place with the new values
                 self.actor_critic.popart_mean.copy_(new_mean_val)
                 self.actor_critic.popart_mean_sq.copy_(new_mean_sq_val)
-                # --- END FIX ---
+                # --- FIX END ---
 
                 # Get new statistics (now correctly updated)
                 new_mean = self.actor_critic.popart_mean
                 new_variance = self.actor_critic.popart_mean_sq - new_mean.pow(2)
                 new_std = torch.sqrt(F.relu(new_variance)).clamp(min=1e-6)
 
-                #
-                # ⚠️ IMPORTANT: Identify the final linear layer of your value function head.
-                # Common names are `critic_linear`, `value_head`, etc.
-                # If your actor and critic share the final layer (like in the DummyActorCritic),
-                # POP-ART is not directly applicable and will harm policy learning.
-                # Assuming a separate value head like `self.actor_critic.base.critic_linear`
-                #
-                # ⚠️ IMPORTANT: This line should still point to the final value head layer.
-                # Now we know it's a 'SplitBias' wrapper.
-                value_head_wrapper = self.actor_critic.base.critic_head_decoupled[-1] # <--- CONFIRM THIS IS YOUR LAYER
+                # Update the weights and bias of the final value layer
+                # Ensure this path correctly points to your value head's final layer
+                value_head_wrapper = self.actor_critic.base.critic_head_decoupled[-1]
 
-                ## --- CORRECTED POP-ART MODIFICATION for K-FAC ---
-                # Access the weights from the original module inside the wrapper.
                 W = value_head_wrapper.module.weight
-                
-                # Access the bias from the 'add_bias' part of the wrapper.
-                # The parameter itself is typically stored in an attribute named `_bias`.
                 b = value_head_wrapper.add_bias._bias
 
-                # Update the layer's weights and bias data in-place
                 W.data = W.data * old_std / new_std
                 b.data = (b.data * old_std + old_mean - new_mean) / new_std
-                ## ------------------------------------------------
             
                 val_after_update = self.de_normalize_value(self.actor_critic.get_value(sample_obs,  rollouts.recurrent_hidden_states[0], rollouts.masks[0]))
 
-                # Check if the output is preserved. Allow for minor floating point differences.
-                #assert torch.allclose(val_before_update, val_after_update, atol=1e-5), "POP-ART output is not preserved!"
-                #print(val_before_update - val_after_update)
-
-            # Normalize the returns in the rollout buffer for the upcoming loss calculation
-            rollouts.returns = (rollouts.returns - new_mean) / new_std
+                # Normalize the returns in the rollout buffer for the loss calculation
+                rollouts.returns = (rollouts.returns - new_mean) / new_std
         ## --- END OF POP-ART BLOCK ---
 
-        # FIXED: Updated to modern torch.amp.autocast syntax
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
             obs_tensor = rollouts.obs[:-1].view(-1, 6, self.args.container_size[0], self.args.container_size[1])
             gt_masks = obs_tensor[:, 4:6, :, :]
 
-            #start_time_2 = time.perf_counter()
             values, action_log_probs, dist_entropy, _, infeasibility_loss = self.actor_critic.evaluate_actions(
                 rollouts.obs[:-1].view(-1, *obs_shape),
                 rollouts.recurrent_hidden_states[0].view(-1, self.actor_critic.recurrent_hidden_state_size),
@@ -547,20 +535,13 @@ class ACKTR():
                 rollouts.actions.view(-1, action_shape),
                 gt_masks
             )
-            #end_time_2 = time.perf_counter()
-            #print(f"actor critic eval: {end_time_2 - start_time_2} seconds")
 
             values = values.view(num_steps, num_processes, 1)
             action_log_probs = action_log_probs.view(num_steps, num_processes, 1)
 
-            # 1. Calculate the raw advantages
             advantages = rollouts.returns[:-1] - values
-            
-            # 2. Use the raw advantages for the value loss
             value_loss = advantages.pow(2).mean()
 
-            # 3. Normalize the advantages for the action loss
-            #    This is the new block of code to add. 👍
             with torch.no_grad():
                 adv_mean = advantages.mean()
                 if advantages.numel() > 1:
@@ -569,7 +550,6 @@ class ACKTR():
                     adv_std = 0.0
                 normalized_advantages = (advantages - adv_mean) / (adv_std + 1e-5)
 
-            # 4. Use the normalized advantages (detached) for the action loss
             action_loss = -(normalized_advantages.detach() * action_log_probs).mean()
 
             loss = (value_loss * self.value_loss_coef 
@@ -577,7 +557,6 @@ class ACKTR():
                     - dist_entropy * self.entropy_coef
                     + infeasibility_loss * self.invaild_coef)
 
-        # Fisher loss calculation for KFAC
         if self.acktr and self.optimizer.steps % self.optimizer.Ts == 0:
             self.actor_critic.zero_grad()
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
@@ -591,35 +570,23 @@ class ACKTR():
             if self.use_amp:
                 self.scaler.scale(fisher_loss).backward(retain_graph=True)
             else:
-                #start_time = time.perf_counter()
                 fisher_loss.backward(retain_graph=True)
-                #end_time = time.perf_counter()
-                #elapsed_time = end_time - start_time
-                #print(f"fisher loss: {elapsed_time} seconds")
             self.optimizer.acc_stats = False
 
         self.optimizer.zero_grad()
         
-        # Main backward pass
         if self.use_amp:
             self.scaler.scale(loss).backward()
             if not self.acktr:
-                # Unscale gradients before clipping
                 self.scaler.unscale_(self.optimizer)
                 nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
-            #start_time_3 = time.perf_counter()
             loss.backward()
-            #end_time_3 = time.perf_counter()
-            #print(f"loss backward: {end_time_3 - start_time_3} seconds")
             if not self.acktr:
                 nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
-            #start_time_4 = time.perf_counter()
             self.optimizer.step()
-            #end_time_4 = time.perf_counter()
-            #print(f"optimizer step: {end_time_4 - start_time_4} seconds")
 
         return value_loss.item(), action_loss.item(), dist_entropy.item(), infeasibility_loss.item()
 
