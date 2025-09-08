@@ -1,5 +1,3 @@
-# envs/bpp0/bin3D.py
-
 import random
 import numpy as np
 import gym
@@ -66,9 +64,15 @@ class PackingGame(gym.Env):
 
     def _get_vectorized_stability_map(self, box_size):
         """
-        Calculates the stability map using a highly optimized vectorized approach.
-        A box is considered placeable if it fits vertically above the highest point
-        in its footprint.
+        Calculates the stability map using a highly optimized vectorized approach,
+        incorporating realistic physical stability checks.
+        
+        A position is valid if it meets three criteria:
+        1. Vertical Fit: The box does not exceed the container's height.
+        2. Corner Support: At least 3 of the 4 corners of the box's base are
+           supported at the same maximum corner height.
+        3. Surface Area Support: A sufficient percentage of the box's base is
+           supported at the true maximum height of the footprint.
         
         Args:
             box_size (tuple): The (width, length, height) of the box to check.
@@ -80,21 +84,54 @@ class PackingGame(gym.Env):
         bin_w, bin_l = heightmap.shape
         box_w, box_l, box_h = box_size
 
-        if box_w > bin_w or box_l > bin_l:
+        if box_w > bin_w or box_l > bin_l or box_w < 1 or box_l < 1:
             return np.zeros_like(heightmap, dtype=np.int32)
 
         # 1. Create a view of all possible (box_w x box_l) patches.
         patches = sliding_window_view(heightmap, window_shape=(box_w, box_l))
 
-        # 2. Calculate the max height for each patch. The box will rest on this point.
+        # 2. Find the true maximum height for each potential placement footprint.
         max_heights = np.max(patches, axis=(2, 3))
-        
-        # 3. MODIFIED: The stability check (max_heights == min_heights) is REMOVED.
-        # A position is valid as long as the box fits vertically.
+
+        # 3. VERTICAL FIT check: Ensure the box doesn't exceed the container height.
         fits_vertically = (max_heights + box_h <= self.height)
-        valid_mask_small = fits_vertically
+
+        # 4. CORNER SUPPORT check (3-Corner Rule)
+        # Extract heights of the four corners for all patches simultaneously.
+        corners_c00 = patches[:, :, 0, 0]
+        corners_c10 = patches[:, :, box_w - 1, 0]
+        corners_c01 = patches[:, :, 0, box_l - 1]
+        corners_c11 = patches[:, :, box_w - 1, box_l - 1]
+
+        # Find the maximum height among the four corners for each patch.
+        max_corner_heights = np.maximum.reduce([corners_c00, corners_c10, corners_c01, corners_c11])
         
-        # 4. Create a full-sized mask and place the result in the top-left.
+        # Count how many corners are at that maximum height for each patch.
+        supported_corners = (corners_c00 == max_corner_heights).astype(np.int8) + \
+                            (corners_c10 == max_corner_heights).astype(np.int8) + \
+                            (corners_c01 == max_corner_heights).astype(np.int8) + \
+                            (corners_c11 == max_corner_heights).astype(np.int8)
+        
+        corner_rule_passed = (supported_corners >= 3)
+
+        # 5. SURFACE AREA SUPPORT check.
+        # Calculate the area supported at the true max height for each patch.
+        # We expand dims of max_heights to allow direct comparison with patches.
+        support_area = np.sum(patches == max_heights[:, :, np.newaxis, np.newaxis], axis=(2, 3))
+        footprint_area = box_w * box_l
+        support_ratio = support_area / footprint_area
+
+        # Apply the tiered stability thresholds.
+        rule1 = (support_ratio > 0.95)
+        rule2 = (max_corner_heights == max_heights) & (supported_corners == 3) & (support_ratio > 0.85)
+        rule3 = (max_corner_heights == max_heights) & (supported_corners == 4) & (support_ratio > 0.50)
+        
+        surface_rule_passed = rule1 | rule2 | rule3
+
+        # 6. Combine all checks. A position is valid only if all rules pass.
+        valid_mask_small = fits_vertically & corner_rule_passed & surface_rule_passed
+        
+        # 7. Create a full-sized mask and place the result in the top-left.
         full_mask = np.zeros_like(heightmap, dtype=np.int32)
         full_mask[:valid_mask_small.shape[0], :valid_mask_small.shape[1]] = valid_mask_small
 
