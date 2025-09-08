@@ -472,35 +472,33 @@ class ACKTR():
         ## --- START OF POP-ART BLOCK ---
         if self.use_popart:
             with torch.no_grad():
-                # The returns in the buffer are currently unnormalized.
                 returns = rollouts.returns
                 
                 # Get old statistics for the linear layer update
                 old_mean = self.actor_critic.popart_mean.clone()
-                # --- START MODIFICATION ---
-                # Calculate variance and ensure it's non-negative before sqrt to prevent NaN.
                 old_variance = self.actor_critic.popart_mean_sq - old_mean.pow(2)
                 old_std = torch.sqrt(F.relu(old_variance)).clamp(min=1e-6)
-                # --- END MODIFICATION ---
-
-                sample_obs = rollouts.obs[0] # Pick a consistent sample
-                val_before_update = self.de_normalize_value(self.actor_critic.get_value(sample_obs, rollouts.recurrent_hidden_states[0], rollouts.masks[0]))
-
 
                 # Update running statistics using the new batch of returns
                 batch_mean = returns.mean()
                 batch_mean_sq = returns.pow(2).mean()
 
-                self.actor_critic.popart_mean.mul_(1 - self.popart_beta).add_(batch_mean, alpha=self.popart_beta)
-                self.actor_critic.popart_mean_sq.mul_(1 - self.popart_beta).add_(batch_mean_sq, alpha=self.popart_beta)
+                # --- START FIX ---
+                # Calculate the new statistics using standard, non-in-place math
+                new_mean_val = (self.actor_critic.popart_mean * (1 - self.popart_beta) + 
+                                batch_mean * self.popart_beta)
+                new_mean_sq_val = (self.actor_critic.popart_mean_sq * (1 - self.popart_beta) + 
+                                batch_mean_sq * self.popart_beta)
 
-                # Get new statistics
+                # Update the buffers in-place with the new values
+                self.actor_critic.popart_mean.copy_(new_mean_val)
+                self.actor_critic.popart_mean_sq.copy_(new_mean_sq_val)
+                # --- END FIX ---
+
+                # Get new statistics (now correctly updated)
                 new_mean = self.actor_critic.popart_mean
-                # --- START MODIFICATION ---
-                # Calculate variance and ensure it's non-negative before sqrt to prevent NaN.
                 new_variance = self.actor_critic.popart_mean_sq - new_mean.pow(2)
                 new_std = torch.sqrt(F.relu(new_variance)).clamp(min=1e-6)
-                # --- END MODIFICATION ---
 
                 #
                 # ⚠️ IMPORTANT: Identify the final linear layer of your value function head.
