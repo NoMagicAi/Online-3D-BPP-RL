@@ -157,74 +157,58 @@ class PackingGame(gym.Env):
         info = {}
 
         if mask_to_check[x_pos, y_pos]:
-            alpha = 1.0
+            # Action is VALID
+            alpha = 1.0  # Volumetric reward hyperparameter
+            beta = 0.5   # Contact reward hyperparameter
+            gamma = 1.5  # Air pocket penalty hyperparameter
+            
+            # --- REWARD CALCULATION (based on state BEFORE action) ---
             volumetric_reward = alpha * self.get_box_ratio()
-
-            # --- START: MODIFIED Contact Surface Reward Calculation ---
-            beta = 0.5
             
             box = self.next_box
             if bool(orientation):
                 box = (box[1], box[0], box[2])
             box_w, box_l, box_h = box
-
-            total_surface_area = 2 * (box_w * box_l + box_w * box_h + box_l * box_h)
-            touching_area = 0.0
             heightmap = self.space.plain
 
             # Determine placement height based on the highest point(s) in the footprint
             footprint_under_box = heightmap[x_pos : x_pos + box_w, y_pos : y_pos + box_l]
-            z_pos = np.max(footprint_under_box) # The box rests on this height
+            z_pos = np.max(footprint_under_box)
 
-            # 1. MODIFIED: Bottom face contact.
-            # Calculates the actual area touching the surface below, which are the
-            # points within the footprint that are at the maximum height.
+            # --- 1. Contact Surface Reward ---
+            total_surface_area = 2 * (box_w * box_l + box_w * box_h + box_l * box_h)
+            touching_area = 0.0
+            
             bottom_contact_area = np.sum(footprint_under_box == z_pos)
             touching_area += bottom_contact_area
             
-            # 2. Side faces contact (-X, +X, -Y, +Y)
-            # This logic remains the same but now correctly uses the new z_pos.
-            # -X face
-            if x_pos == 0:
-                touching_area += box_l * box_h
-            else:
-                adjacent_heights = heightmap[x_pos - 1, y_pos : y_pos + box_l]
-                overlap_heights = np.maximum(0, np.minimum(z_pos + box_h, adjacent_heights) - z_pos)
-                touching_area += np.sum(overlap_heights)
-
-            # +X face
-            if x_pos + box_w == self.width:
-                touching_area += box_l * box_h
-            else:
-                adjacent_heights = heightmap[x_pos + box_w, y_pos : y_pos + box_l]
-                overlap_heights = np.maximum(0, np.minimum(z_pos + box_h, adjacent_heights) - z_pos)
-                touching_area += np.sum(overlap_heights)
-
-            # -Y face
-            if y_pos == 0:
-                touching_area += box_w * box_h
-            else:
-                adjacent_heights = heightmap[x_pos : x_pos + box_w, y_pos - 1]
-                overlap_heights = np.maximum(0, np.minimum(z_pos + box_h, adjacent_heights) - z_pos)
-                touching_area += np.sum(overlap_heights)
-
-            # +Y face
-            if y_pos + box_l == self.length:
-                touching_area += box_w * box_h
-            else:
-                adjacent_heights = heightmap[x_pos : x_pos + box_w, y_pos + box_l]
-                overlap_heights = np.maximum(0, np.minimum(z_pos + box_h, adjacent_heights) - z_pos)
-                touching_area += np.sum(overlap_heights)
-
+            # Side faces contact
+            if x_pos == 0: touching_area += box_l * box_h
+            else: touching_area += np.sum(np.maximum(0, np.minimum(z_pos + box_h, heightmap[x_pos - 1, y_pos:y_pos + box_l]) - z_pos))
+            if x_pos + box_w == self.width: touching_area += box_l * box_h
+            else: touching_area += np.sum(np.maximum(0, np.minimum(z_pos + box_h, heightmap[x_pos + box_w, y_pos:y_pos + box_l]) - z_pos))
+            if y_pos == 0: touching_area += box_w * box_h
+            else: touching_area += np.sum(np.maximum(0, np.minimum(z_pos + box_h, heightmap[x_pos:x_pos + box_w, y_pos - 1]) - z_pos))
+            if y_pos + box_l == self.length: touching_area += box_w * box_h
+            else: touching_area += np.sum(np.maximum(0, np.minimum(z_pos + box_h, heightmap[x_pos:x_pos + box_w, y_pos + box_l]) - z_pos))
+            
             contact_reward = 0.0
             if total_surface_area > 0:
                 contact_reward = beta * (touching_area / total_surface_area)
-            # --- END: MODIFIED Contact Surface Reward Calculation ---
 
-            reward = volumetric_reward + contact_reward
+            # --- 2. Air Pocket Penalty ---
+            # This is the volume of the empty space created under the box
+            air_pocket_volume = z_pos * box_w * box_l - np.sum(footprint_under_box)
+            bin_volume = self.width * self.length * self.height
+            air_pocket_penalty = gamma * (air_pocket_volume / bin_volume)
 
+            # --- 3. Final Reward ---
+            reward = volumetric_reward + contact_reward - air_pocket_penalty
+
+            # Execute the action and change the state
             self.space.drop_box(self.next_box, (x_pos, y_pos), bool(orientation))
             
+            # Advance to the next box and update the state for the next step
             self.box_creator.drop_box()
             self.box_creator.generate_box_size()
             self._update_masks()
@@ -234,6 +218,7 @@ class PackingGame(gym.Env):
                 info['failed_box_dims'] = self.next_box
                 info['failed_box_pos'] = None
         else:
+            # Action is INVALID
             done = True
             reward = 0.0
             
