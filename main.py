@@ -95,7 +95,10 @@ def log_final_heatmap(logger, heightmap, container_size, iteration):
 # In your main training script
 
 def log_3d_render(logger, boxes, container_size, iteration, failed_box_info=None, final_heightmap=None):
-    """Logs a 3D voxel render, including a failed box if provided."""
+    """
+    Logs a 3D voxel render, including a failed box with a visual hint
+    for the reason of episode termination.
+    """
     if not boxes and not failed_box_info:
         return
 
@@ -116,43 +119,50 @@ def log_3d_render(logger, boxes, container_size, iteration, failed_box_info=None
             box_color = cmap(i + 1)
             
             if (0 <= x < container_size[0] and 0 <= y < container_size[1] and 0 <= z < container_size[2]):
-                 facecolors_array[x:x+w, y:y+l, z:z+h] = box_color
+                    facecolors_array[x:x+w, y:y+l, z:z+h] = box_color
 
-    # --- MODIFICATION START: Correctly render the failed box ---
+    # --- MODIFICATION START: Add visual hints for failure reason ---
+    title_text = f'3D Render (Update {iteration})' # Default title
+
     if failed_box_info and 'dims' in failed_box_info and final_heightmap is not None:
-        # For debugging, you can uncomment the next line to see if the info arrives here
-        # print(f"DEBUG: Rendering failed box with info: {failed_box_info}")
-        
         dims = failed_box_info['dims']
         pos = failed_box_info.get('pos')
         
         w, l, h = int(dims[0]), int(dims[1]), int(dims[2])
         
-        # Determine the position of the failed attempt
+        # Default to a black box for a standard invalid move
+        failed_box_color = [0, 0, 0, 0.8] 
+
         if pos is not None:
-            # Invalid action at a specific (x, y)
+            # Case 1: Episode ended due to an INVALID ACTION at a specific (x, y)
+            title_text = (
+                f'Invalid Action at Update {iteration}\n'
+                f'Failed Item Dims: {w}x{l}x{h} at ({int(pos[0])}, {int(pos[1])})'
+            )
             x, y = int(pos[0]), int(pos[1])
             footprint = final_heightmap[x:min(x + w, container_size[0]), y:min(y + l, container_size[1])]
             z_attempt = int(np.max(footprint)) if footprint.size > 0 else 0
         else:
-            # No valid moves left; place at corner on top of the highest point
-            x, y = 0, 0
+            # Case 2: Episode ended because NO VALID MOVES were left
+            title_text = (
+                f'No Valid Moves Left at Update {iteration}\n'
+                f'Next Item Dims: {w}x{l}x{h}'
+            )
+            # Use a distinct color (RED) to indicate this specific failure type
+            failed_box_color = [1, 0, 0, 0.8] # Red, semi-transparent
+            x, y = 0, 0 # Place at a default corner for visualization
             z_attempt = int(np.max(final_heightmap)) if final_heightmap.size > 0 else 0
 
-        # --- THIS IS THE FIX ---
-        # Clamp the Z-position to ensure the box is drawn inside the container volume.
-        # This forces the box's top surface to be, at most, flush with the container's top.
+        # The clamping fix remains the same, it's essential for both cases
         z = min(z_attempt, container_size[2] - h)
-        z = max(z, 0) # Ensure z is not negative
+        z = max(z, 0)
 
-        # Clip dimensions to stay within the container for visualization
+        # Clip dimensions and draw the failed box with the chosen color
         x_end = min(x + w, container_size[0])
         y_end = min(y + l, container_size[1])
         z_end = min(z + h, container_size[2])
-        
-        # Color the region black if it has volume
         if x < x_end and y < y_end and z < z_end:
-            facecolors_array[x:x_end, y:y_end, z:z_end] = [0, 0, 0, 0.8] # Black, semi-transparent
+            facecolors_array[x:x_end, y:y_end, z:z_end] = failed_box_color
     # --- MODIFICATION END ---
 
     filled = np.any(facecolors_array[..., :3] != [0, 0, 0], axis=-1)
@@ -161,7 +171,7 @@ def log_3d_render(logger, boxes, container_size, iteration, failed_box_info=None
     ax.set_xlabel('Width')
     ax.set_ylabel('Length')
     ax.set_zlabel('Height')
-    ax.set_title(f'3D Render with Failed Item (Update {iteration})')
+    ax.set_title(title_text) # Use the new dynamic title
     ax.set_xlim(0, container_size[0])
     ax.set_ylim(0, container_size[1])
     ax.set_zlim(0, container_size[2])
