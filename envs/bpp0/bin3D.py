@@ -67,6 +67,8 @@ class PackingGame(gym.Env):
     def _get_vectorized_stability_map(self, box_size):
         """
         Calculates the stability map using a highly optimized vectorized approach.
+        A box is considered placeable if it fits vertically above the highest point
+        in its footprint.
         
         Args:
             box_size (tuple): The (width, length, height) of the box to check.
@@ -78,25 +80,21 @@ class PackingGame(gym.Env):
         bin_w, bin_l = heightmap.shape
         box_w, box_l, box_h = box_size
 
-        # If the box can't fit horizontally, no positions are valid.
         if box_w > bin_w or box_l > bin_l:
             return np.zeros_like(heightmap, dtype=np.int32)
 
         # 1. Create a view of all possible (box_w x box_l) patches.
         patches = sliding_window_view(heightmap, window_shape=(box_w, box_l))
 
-        # 2. Calculate the max and min height for each patch vectorized.
+        # 2. Calculate the max height for each patch. The box will rest on this point.
         max_heights = np.max(patches, axis=(2, 3))
-        min_heights = np.min(patches, axis=(2, 3))
-
-        # 3. Check stability (all ground points are level) and vertical fit.
-        is_stable = (max_heights == min_heights)
+        
+        # 3. MODIFIED: The stability check (max_heights == min_heights) is REMOVED.
+        # A position is valid as long as the box fits vertically.
         fits_vertically = (max_heights + box_h <= self.height)
+        valid_mask_small = fits_vertically
         
-        # 4. A position is valid only if both conditions are met.
-        valid_mask_small = np.logical_and(is_stable, fits_vertically)
-        
-        # 5. Create a full-sized mask and place the result in the top-left.
+        # 4. Create a full-sized mask and place the result in the top-left.
         full_mask = np.zeros_like(heightmap, dtype=np.int32)
         full_mask[:valid_mask_small.shape[0], :valid_mask_small.shape[1]] = valid_mask_small
 
@@ -156,53 +154,101 @@ class PackingGame(gym.Env):
         orientation, x_pos, y_pos = action
         mask_to_check = self.mask_o1 if bool(orientation) else self.mask_o0
         
-        # MODIFICATION START: Initialize info and handle failure cases explicitly
         info = {}
 
         if mask_to_check[x_pos, y_pos]:
-            # Action is VALID
-            alpha = 1.0  # Hyperparameter for volumetric reward
-            
-            # --- REWARD CALCULATION (existing logic) ---
+            alpha = 1.0
             volumetric_reward = alpha * self.get_box_ratio()
-            # ... (rest of the reward calculation logic) ...
-            reward = volumetric_reward
 
-            # Execute the action and change the state
+            # --- START: MODIFIED Contact Surface Reward Calculation ---
+            beta = 0.5
+            
+            box = self.next_box
+            if bool(orientation):
+                box = (box[1], box[0], box[2])
+            box_w, box_l, box_h = box
+
+            total_surface_area = 2 * (box_w * box_l + box_w * box_h + box_l * box_h)
+            touching_area = 0.0
+            heightmap = self.space.plain
+
+            # Determine placement height based on the highest point(s) in the footprint
+            footprint_under_box = heightmap[x_pos : x_pos + box_w, y_pos : y_pos + box_l]
+            z_pos = np.max(footprint_under_box) # The box rests on this height
+
+            # 1. MODIFIED: Bottom face contact.
+            # Calculates the actual area touching the surface below, which are the
+            # points within the footprint that are at the maximum height.
+            bottom_contact_area = np.sum(footprint_under_box == z_pos)
+            touching_area += bottom_contact_area
+            
+            # 2. Side faces contact (-X, +X, -Y, +Y)
+            # This logic remains the same but now correctly uses the new z_pos.
+            # -X face
+            if x_pos == 0:
+                touching_area += box_l * box_h
+            else:
+                adjacent_heights = heightmap[x_pos - 1, y_pos : y_pos + box_l]
+                overlap_heights = np.maximum(0, np.minimum(z_pos + box_h, adjacent_heights) - z_pos)
+                touching_area += np.sum(overlap_heights)
+
+            # +X face
+            if x_pos + box_w == self.width:
+                touching_area += box_l * box_h
+            else:
+                adjacent_heights = heightmap[x_pos + box_w, y_pos : y_pos + box_l]
+                overlap_heights = np.maximum(0, np.minimum(z_pos + box_h, adjacent_heights) - z_pos)
+                touching_area += np.sum(overlap_heights)
+
+            # -Y face
+            if y_pos == 0:
+                touching_area += box_w * box_h
+            else:
+                adjacent_heights = heightmap[x_pos : x_pos + box_w, y_pos - 1]
+                overlap_heights = np.maximum(0, np.minimum(z_pos + box_h, adjacent_heights) - z_pos)
+                touching_area += np.sum(overlap_heights)
+
+            # +Y face
+            if y_pos + box_l == self.length:
+                touching_area += box_w * box_h
+            else:
+                adjacent_heights = heightmap[x_pos : x_pos + box_w, y_pos + box_l]
+                overlap_heights = np.maximum(0, np.minimum(z_pos + box_h, adjacent_heights) - z_pos)
+                touching_area += np.sum(overlap_heights)
+
+            contact_reward = 0.0
+            if total_surface_area > 0:
+                contact_reward = beta * (touching_area / total_surface_area)
+            # --- END: MODIFIED Contact Surface Reward Calculation ---
+
+            reward = volumetric_reward + contact_reward
+
             self.space.drop_box(self.next_box, (x_pos, y_pos), bool(orientation))
             
-            # Advance to the next box and update the state for the next step
             self.box_creator.drop_box()
             self.box_creator.generate_box_size()
             self._update_masks()
             done = not (self.mask_o0.any() or self.mask_o1.any())
             
             if done:
-                # Case 1: Episode ended because the NEW box has no valid moves.
                 info['failed_box_dims'] = self.next_box
-                info['failed_box_pos'] = None # No specific failed position
+                info['failed_box_pos'] = None
         else:
-            # Action is INVALID
             done = True
             reward = 0.0
             
-            # Case 2: Episode ended because the agent chose an invalid position.
             box_being_placed = self.next_box
             if bool(orientation):
-                # Account for the agent attempting a rotated placement
                 box_being_placed = (box_being_placed[1], box_being_placed[0], box_being_placed[2])
             
             info['failed_box_dims'] = box_being_placed
             info['failed_box_pos'] = (x_pos, y_pos)
 
-        # This info is always relevant
         info["counter"] = len(self.space.stacking_tree.boxes)
         info["ratio"] = self.space.get_ratio()
 
-        # If the episode ended for ANY reason, log the final state of packed items.
         if done:
             info['final_heightmap'] = self.space.plain
             info['final_boxes'] = self.space.stacking_tree.boxes
-        # MODIFICATION END
             
         return self.cur_observation, reward, done, info
