@@ -38,6 +38,14 @@ def get_args():
     parser.add_argument('--data_name', default='cut_2.pt')
     parser.add_argument('--load_name', default='default_cut_2.pt')
     parser.add_argument('--load_dir', default='./pretrained_models/')
+    # --- ADD THESE LINES ---
+    parser.add_argument('--lr', type=float, default=0.1, 
+                        help='learning rate (default: 0.1)')
+    parser.add_argument('--kfac-clip', type=float, default=0.001,
+                        help='KL clipping parameter for KFAC (default: 0.001)')
+    parser.add_argument('--kfac-damping', type=float, default=1e-2,
+                        help='Damping parameter for KFAC (default: 0.01)')
+    # --- END OF ADDED LINES ---
     parser.add_argument('--save_dir', default='./saved_models/')
     parser.add_argument('--seed', default=1, type=int)
     parser.add_argument('--use-popart', action='store_true', default=False,

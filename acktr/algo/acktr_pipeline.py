@@ -400,10 +400,7 @@ class ACKTR():
                  entropy_coef,
                  invaild_coef,
                  acktr=False,
-                 # KFAC-specific hyperparameters
-                 lr=0.001, 
-                 kfac_clip=0.001,
-                 kfac_damping=1e-2,
+                 # KFAC-specific hyperparameters are now in the args object
                  kfac_stat_decay=0.99,
                  # Standard hyperparameters
                  eps=1e-5,
@@ -423,8 +420,6 @@ class ACKTR():
         self.use_amp = use_amp and torch.cuda.is_available()
         self.use_popart = args.use_popart
         if self.use_popart:
-            # Register buffers to the actor_critic model. This ensures they are part of the
-            # model's state_dict and get moved to the correct device automatically.
             self.actor_critic.register_buffer('popart_mean', torch.zeros(1, device=args.device))
             self.actor_critic.register_buffer('popart_mean_sq', torch.ones(1, device=args.device))
             self.popart_beta = args.popart_beta
@@ -432,14 +427,14 @@ class ACKTR():
         if acktr:
             self.optimizer = KFACOptimizer(
                 actor_critic, 
-                lr=lr, 
-                kl_clip=kfac_clip,
-                damping=kfac_damping,
+                lr=args.lr,               # <-- Now uses the value from your arguments
+                kl_clip=args.kfac_clip,   # <-- Now uses the value from your arguments
+                damping=args.kfac_damping,# <-- Now uses the value from your arguments
                 stat_decay=kfac_stat_decay
             )
         else:
             self.optimizer = optim.RMSprop(
-                actor_critic.parameters(), lr, eps=eps, alpha=alpha)
+                actor_critic.parameters(), args.lr, eps=eps, alpha=alpha) # Changed to args.lr here too for consistency
         
         if self.use_amp:
             self.scaler = torch.cuda.amp.GradScaler()
