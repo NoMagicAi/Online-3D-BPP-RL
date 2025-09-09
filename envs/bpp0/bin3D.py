@@ -89,51 +89,44 @@ class PackingGame(gym.Env):
         # 3. VERTICAL FIT check: Ensure the box doesn't exceed the container height.
         fits_vertically = (max_heights + box_h <= self.height)
 
-        # 4. CORNER SUPPORT check (Improved Logic)
+        # 4. CORNER SUPPORT check (3-Corner Rule)
+        # Extract heights of the four corners for all patches simultaneously.
         corners_c00 = patches[:, :, 0, 0]
         corners_c10 = patches[:, :, box_w - 1, 0]
         corners_c01 = patches[:, :, 0, box_l - 1]
         corners_c11 = patches[:, :, box_w - 1, box_l - 1]
 
-        # The placement height is determined by the highest of the four corners.
+        # Find the maximum height among the four corners for each patch.
         max_corner_heights = np.maximum.reduce([corners_c00, corners_c10, corners_c01, corners_c11])
         
-        # A box is stable if the highest point under its entire footprint
-        # is NO HIGHER than the height of its supporting corners.
-        # This prevents balancing on a central point.
-        corner_stability_check = (max_heights == max_corner_heights)
-        
-        # Count how many corners are at that maximum placement height.
+        # Count how many corners are at that maximum height for each patch.
         supported_corners = (corners_c00 == max_corner_heights).astype(np.int8) + \
                             (corners_c10 == max_corner_heights).astype(np.int8) + \
                             (corners_c01 == max_corner_heights).astype(np.int8) + \
                             (corners_c11 == max_corner_heights).astype(np.int8)
-        
-        three_corners_supported = (supported_corners >= 3)
-        
-        # A position has corner support if it passes both checks.
-        corner_rule_passed = corner_stability_check & three_corners_supported
 
         # 5. SURFACE AREA SUPPORT check.
-        # This rule acts as an alternative to the corner rule.
+        # Calculate the area supported at the true max height for each patch.
+        # We expand dims of max_heights to allow direct comparison with patches.
         support_area = np.sum(patches == max_heights[:, :, np.newaxis, np.newaxis], axis=(2, 3))
         footprint_area = box_w * box_l
         support_ratio = support_area / footprint_area
-        
-        # A position is stable if over 70% of its footprint is supported at the max height.
-        surface_rule_passed = (support_ratio > 0.7)
 
-        # 6. Combine all checks.
-        # A position is valid if it fits vertically AND
-        # (it has enough corner support OR it has enough surface area support).
-        valid_mask_small = fits_vertically & (corner_rule_passed | surface_rule_passed)
+        # Apply the tiered stability thresholds.
+        rule1 = (support_ratio > 0.5)
+        rule2 = (max_corner_heights == max_heights) & (supported_corners >= 3)
+        
+        surface_rule_passed = rule1 | rule2
+
+        # 6. Combine all checks. A position is valid only if all rules pass.
+        valid_mask_small = fits_vertically & surface_rule_passed
         
         # 7. Create a full-sized mask and place the result in the top-left.
         full_mask = np.zeros_like(heightmap, dtype=np.int32)
         full_mask[:valid_mask_small.shape[0], :valid_mask_small.shape[1]] = valid_mask_small
 
         return full_mask
-
+    
     def _update_masks(self):
         """
         A private helper to compute and store the feasibility masks for the current state
